@@ -156,161 +156,320 @@ def save_env_value(key: str, value: str) -> None:
 
         else:
 
-        "No cheerleading, no hedging everything with 'but DYOR'. "
-        "You sound like someone who's been burned enough times to stop being cocky, "
-        "but still has conviction.\n\n"
-        "When you see a post — reply with ONE sharp take. "
-        "Something you'd actually type between watching the tape.\n\n"
-        "Rules:\n"
-        "- English only\n"
-        "- 1-2 sentences MAX -- target 120-150 characters total\n"
-        "- No hashtags, no emojis, no 'great point', no 'I agree', no 'absolutely'\n"
-        "- Casual but sharp -- like texting a trading buddy, not writing a report\n"
-        "- Specific is better than vague -- levels, indicators, flow > generic wisdom\n"
-        "Good examples:\n"
-        "  'VIX term structure still inverted, that's the tell nobody's watching'\n"
-        "  'gamma flip at 5200 -- above that dealers are forced buyers all day'\n"
-        "  'retail piling in while GEX went negative yesterday, not a great combo'\n"
-        "  'BTC dominance breaking out usually means alts get wrecked first'\n"
-        "  'been wrong before but this smells like a stop hunt before the real move'\n\n"
-        "Bad examples (never do this):\n"
-        "  'Great insight! The market dynamics you described are indeed fascinating...'\n"
-        "  'I completely agree with your analysis of the current macroeconomic situation.'\n"
-        "  'As a professional trader I can confirm that risk management is key #trading'"
-    )
+        "No cheerleading, no hedging everything with 'but DYOR'. "
+
+        "You sound like someone who's been burned enough times to stop being cocky, "
+
+        "but still has conviction.\n\n"
+
+        "When you see a post — reply with ONE sharp take. "
+
+        "Something you'd actually type between watching the tape.\n\n"
+
+        "Rules:\n"
+
+        "- English only\n"
+
+        "- 1-2 sentences MAX -- target 120-150 characters total\n"
+
+        "- No hashtags, no emojis, no 'great point', no 'I agree', no 'absolutely'\n"
+
+        "- Casual but sharp -- like texting a trading buddy, not writing a report\n"
+
+        "- Specific is better than vague -- levels, indicators, flow > generic wisdom\n"
+
+        "Good examples:\n"
+
+        "  'VIX term structure still inverted, that's the tell nobody's watching'\n"
+
+        "  'gamma flip at 5200 -- above that dealers are forced buyers all day'\n"
+
+        "  'retail piling in while GEX went negative yesterday, not a great combo'\n"
+
+        "  'BTC dominance breaking out usually means alts get wrecked first'\n"
+
+        "  'been wrong before but this smells like a stop hunt before the real move'\n\n"
+
+        "Bad examples (never do this):\n"
+
+        "  'Great insight! The market dynamics you described are indeed fascinating...'\n"
+
+        "  'I completely agree with your analysis of the current macroeconomic situation.'\n"
+
+        "  'As a professional trader I can confirm that risk management is key #trading'"
+
+    )
+
+
+
+
+
+_settings: Optional[AppSettings] = None
+
+
+
+
+
+def get_settings() -> AppSettings:
+
+    global _settings
+
+    if _settings is None:
+
+        _settings = AppSettings()
+
+    return _settings
+
+
+
+
+
+def reload_settings() -> AppSettings:
+
+    """Force reload settings from .env -- call after saving new API keys."""
+
+    global _settings, _fernet
+
+    _settings = None
+
+    _fernet = None
+
+    return get_settings()
+
+
+
+
+
+# ---------------------------------------------------------------------------
+
+# LOGGER
+
+# ---------------------------------------------------------------------------
+
+
+
+def _setup_logger() -> None:
+
+    try:
+
+        s = get_settings()
+
+        log_level = s.log_level
+
+        log_file = s.log_file
+
+    except Exception:
+
+        log_level = "INFO"
+
+        log_file = _LOG_DIR / "xbot.log"
+
+
+
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+
+    logger.remove()
+
+
+
+    _TG_NOISE = (
+
+        "telegram._bot",
+
+        "telegram.ext._extbot",
+
+        "telegram.request._baserequest",
+
+        "telegram.request._httpxrequest",
+
+        "httpx",
+
+        "httpcore",
+
+    )
+
+
+
+    def _noise_filter(record) -> bool:
+
+        name = record["name"]
+
+        if any(name.startswith(m) for m in _TG_NOISE):
+
+            return record["level"].name not in ("DEBUG", "TRACE")
+
+        return True
+
+
+
+    for noisy in ("httpx", "httpcore", "telegram.ext._application",
+
+                  "apscheduler", "telegram.ext._updater"):
+
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+
+
+
+    _LEVEL_ICONS = {
+
+        "TRACE":    "· TRACE  ",
+
+    global _fernet
+    if _fernet is None:
+        _fernet = Fernet(get_settings().encryption_key.encode())
+    return _fernet
 
 
-_settings: Optional[AppSettings] = None
+def encrypt(text: str) -> str:
+    return _get_fernet().encrypt(text.encode()).decode()
 
 
-def get_settings() -> AppSettings:
-    global _settings
-    if _settings is None:
-        _settings = AppSettings()
-    return _settings
+def decrypt(token: str) -> str:
+    return _get_fernet().decrypt(token.encode()).decode()
 
 
-def reload_settings() -> AppSettings:
-    """Force reload settings from .env -- call after saving new API keys."""
-    global _settings, _fernet
-    _settings = None
-    _fernet = None
-    return get_settings()
+def generate_key() -> str:
+    return Fernet.generate_key().decode()
 
 
 # ---------------------------------------------------------------------------
-# LOGGER
+# ANTI-DETECT: delays & headers
 # ---------------------------------------------------------------------------
 
-def _setup_logger() -> None:
-    try:
-        s = get_settings()
-        log_level = s.log_level
-        log_file = s.log_file
-    except Exception:
-        log_level = "INFO"
-        log_file = _LOG_DIR / "xbot.log"
+_CHROME_UAS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_6_1) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36 Edg/126.0.0.0",
+]
 
-    log_file.parent.mkdir(parents=True, exist_ok=True)
-    logger.remove()
+_SEC_CH_UA_MAP = {
+    "Chrome/128": '"Chromium";v="128", "Not;A=Brand";v="24", "Google Chrome";v="128"',
+    "Chrome/127": '"Chromium";v="127", "Not;A=Brand";v="24", "Google Chrome";v="127"',
+    "Chrome/126": '"Chromium";v="126", "Not;A=Brand";v="24", "Microsoft Edge";v="126"',
+}
 
-    _TG_NOISE = (
-        "telegram._bot",
-        "telegram.ext._extbot",
-        "telegram.request._baserequest",
-        "telegram.request._httpxrequest",
-        "httpx",
-        "httpcore",
-    )
 
-    def _noise_filter(record) -> bool:
-        name = record["name"]
-        if any(name.startswith(m) for m in _TG_NOISE):
-            return record["level"].name not in ("DEBUG", "TRACE")
-        return True
-
-    for noisy in ("httpx", "httpcore", "telegram.ext._application",
-                  "apscheduler", "telegram.ext._updater"):
-        logging.getLogger(noisy).setLevel(logging.WARNING)
-
-    _LEVEL_ICONS = {
-        "TRACE":    "· TRACE  ",
-        "DEBUG":    "· DEBUG  ",
-        "INFO":     "ℹ INFO   ",
-        "SUCCESS":  "✓ OK     ",
-        "WARNING":  "⚠ WARN   ",
-        "ERROR":    "✖ ERROR  ",
-        "CRITICAL": "✖ CRIT   ",
+def get_browser_headers(ua: Optional[str] = None) -> dict[str, str]:
+    if ua is None:
+        ua = random.choice(_CHROME_UAS)
+    sec_ch_ua = '"Chromium";v="128", "Not;A=Brand";v="24", "Google Chrome";v="128"'
+    for key, val in _SEC_CH_UA_MAP.items():
+        if key in ua:
+            sec_ch_ua = val
+            break
+    platform = '"macOS"' if "Macintosh" in ua else ('"Linux"' if "Linux" in ua else '"Windows"')
+    return {
+        "User-Agent":         ua,
+        "Accept-Language":    "en-US,en;q=0.9",
+        "Accept-Encoding":    "gzip, deflate, br, zstd",
+        "Accept":             "*/*",
+        "sec-ch-ua":          sec_ch_ua,
+        "sec-ch-ua-mobile":   "?0",
+        "sec-ch-ua-platform": platform,
+        "Sec-Fetch-Dest":     "empty",
+        "Sec-Fetch-Mode":     "cors",
+        "Sec-Fetch-Site":     "same-origin",
+        "DNT":                "1",
+        "Connection":         "keep-alive",
     }
 
-    def _console_fmt(record) -> str:
-        lvl = record["level"].name
-        icon = _LEVEL_ICONS.get(lvl, f" {lvl:<8}")
-        mod = record["name"].split(".")[-1][:10]
-        ts = record["time"].strftime("%H:%M:%S")
-        _colors = {
-            "TRACE":    ("\033[90m", "\033[0m"),
-            "DEBUG":    ("\033[90m", "\033[0m"),
-            "INFO":     ("\033[0m",  "\033[0m"),
-            "SUCCESS":  ("\033[92m", "\033[0m"),
-            "WARNING":  ("\033[93m", "\033[0m"),
-            "ERROR":    ("\033[91m", "\033[0m"),
-            "CRITICAL": ("\033[91m", "\033[0m"),
-        }
-        c_on, c_off = _colors.get(lvl, ("", ""))
-        return (
-            f"\033[36m{ts}\033[0m"
-            f" \033[90m│\033[0m "
-            f"{c_on}{icon}{c_off}"
-            f" \033[90m│\033[0m "
-            f"\033[35m{mod:<10}\033[0m"
-            f" \033[90m│\033[0m "
-            f"{c_on}{record['message']}{c_off}"
-            "\n"
-        )
 
-    _file_fmt = (
-        "{time:YYYY-MM-DD HH:mm:ss} | "
-        "{level: <8} | "
-        "{name}:{function}:{line} | "
-        "{message}"
-    )
+async def human_delay(min_s: float = 2 * 60, max_s: float = 10 * 60) -> None:
+    """Random delay between min_s and max_s. Default: 2-10 minutes."""
+    wait = random.uniform(min_s, max_s)
+    if random.random() < 0.15:
+        wait += random.uniform(2 * 60, 8 * 60)
+        logger.debug(f"Human delay (long break): {wait / 60:.1f}min")
+    else:
+        logger.debug(f"Human delay: {wait / 60:.1f}min")
+    wait = max(90, wait)  # hard floor 90 seconds
+    await asyncio.sleep(wait)
 
-    if sys.stdout is not None:
-        try:
-            logger.add(
-                sys.stdout,
-                format=_console_fmt,
-                level=log_level,
-                colorize=False,
-                filter=_noise_filter,
+
+async def read_delay(text: str) -> None:
+    words = len(text.split())
+    wpm = random.randint(180, 280)
+    await asyncio.sleep(max(1.5, (words / wpm) * 60))
+
+
+async def compose_delay(reply_text: str) -> None:
+    cps = random.uniform(3, 8)
+    await asyncio.sleep(max(2.0, len(reply_text) / cps))
+
+
+class RateLimiter:
+    def __init__(self):
+        self._history: dict[int, list[float]] = {}
+
+    def record(self, account_id: int) -> None:
+        now = time.monotonic()
+        self._history.setdefault(account_id, []).append(now)
+        self._history[account_id] = [t for t in self._history[account_id] if t > now - 86400]
+
+    def count_last_30min(self, account_id: int) -> int:
+        cutoff = time.monotonic() - 1800
+        return sum(1 for t in self._history.get(account_id, []) if t > cutoff)
+
+    def count_last_hour(self, account_id: int) -> int:
+        cutoff = time.monotonic() - 3600
+        return sum(1 for t in self._history.get(account_id, []) if t > cutoff)
+
+    def count_today(self, account_id: int) -> int:
+        cutoff = time.monotonic() - 86400
+        return sum(1 for t in self._history.get(account_id, []) if t > cutoff)
+
+    @staticmethod
+    def _is_active_hours(start: int = 8, end: int = 23) -> bool:
+        hour = time.localtime().tm_hour
+        return start <= hour < end
+
+    async def wait_if_needed(
+        self,
+        account_id: int,
+        daily_limit: int = 300,
+        active_hours_start: int = 8,
+        active_hours_end: int = 23,
+        outside_sleep_min: int = 300,
+        wake_event: "asyncio.Event | None" = None,
+    ) -> bool:
+        if self.count_today(account_id) >= daily_limit:
+            logger.warning(f"[Acc {account_id}] Daily limit reached ({daily_limit})")
+            return False
+
+        if not self._is_active_hours(active_hours_start, active_hours_end):
+            wait_s = outside_sleep_min * 60
+            h, m = divmod(outside_sleep_min, 60)
+            label = f"{h}ч {m}м" if h else f"{m}м"
+            logger.info(
+                f"[Acc {account_id}] Outside active hours "
+                f"({active_hours_start}:00-{active_hours_end}:00) - sleeping {label}"
             )
-        except Exception:
-            pass
+            if wake_event is not None:
+                wake_event.clear()
+                try:
+                    await asyncio.wait_for(wake_event.wait(), timeout=wait_s)
+                    logger.info(f"[Acc {account_id}] Outside-hours sleep interrupted by force_wake")
+                except asyncio.TimeoutError:
+                    pass
+            else:
+                await asyncio.sleep(wait_s)
 
-    try:
-        logger.add(
-            log_file,
-            format=_file_fmt,
-            level=log_level,
-            rotation="10 MB",
-            retention="7 days",
-            compression="gz",
-            filter=_noise_filter,
-            colorize=False,
-        )
-    except Exception:
-        pass
+        per_hour = self.count_last_hour(account_id)
+        if per_hour >= 5:
+            wait = random.uniform(12 * 60, 20 * 60)
+            logger.info(f"[Acc {account_id}] Hourly cap ({per_hour}/5) - wait {wait / 60:.0f}min")
+            await asyncio.sleep(wait)
 
+        per_30 = self.count_last_30min(account_id)
+        if per_30 >= 3:
+            wait = random.uniform(8 * 60, 15 * 60)
+            logger.info(f"[Acc {account_id}] Burst cap ({per_30}/3 in 30min) - wait {wait / 60:.0f}min")
+            await asyncio.sleep(wait)
 
-_setup_logger()
-
-
-# ---------------------------------------------------------------------------
-# CRYPTO
-# ---------------------------------------------------------------------------
-
-_fernet: Optional[Fernet] = None
+        return True
 
 
-def _get_fernet() -> Fernet:
+rate_limiter = RateLimiter()
