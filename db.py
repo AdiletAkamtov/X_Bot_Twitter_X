@@ -126,3 +126,131 @@ async def init_db() -> None:
             "ALTER TABLE posts_log ADD COLUMN post_url TEXT",
             "ALTER TABLE posts_log ADD COLUMN reply_variant2 TEXT",
             "ALTER TABLE posts_log ADD COLUMN sleep_seconds REAL",
+        ]
+        for sql in migrations:
+            try:
+                await db.execute(sql)
+            except Exception:
+                pass  # column already exists
+        await db.commit()
+
+
+async def fetchone(sql: str, params: tuple = ()) -> Optional[dict]:
+    async with aiosqlite.connect(_db_path()) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(sql, params) as cur:
+            row = await cur.fetchone()
+            return dict(row) if row else None
+
+
+async def fetchall(sql: str, params: tuple = ()) -> list[dict]:
+    async with aiosqlite.connect(_db_path()) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(sql, params) as cur:
+            rows = await cur.fetchall()
+            return [dict(r) for r in rows]
+
+
+async def execute(sql: str, params: tuple = ()) -> int:
+    async with _write_sem():
+        async with aiosqlite.connect(_db_path()) as db:
+            async with db.execute(sql, params) as cur:
+                await db.commit()
+                return cur.lastrowid
+
+
+# ── Accounts ───────────────────────────────────────────────────────────
+
+
+async def add_account(
+    username: str, auth_token_enc: str, ct0_enc: str, proxy_id: Optional[int] = None
+) -> int:
+    return await execute(
+        "INSERT OR REPLACE INTO accounts (username, auth_token, ct0, proxy_id) VALUES (?,?,?,?)",
+        (username, auth_token_enc, ct0_enc, proxy_id),
+    )
+
+
+async def get_account(account_id: int) -> Optional[dict]:
+    return await fetchone("SELECT * FROM accounts WHERE id=?", (account_id,))
+
+
+async def get_accounts(active_only: bool = True) -> list[dict]:
+    sql = "SELECT * FROM accounts" + (" WHERE active=1" if active_only else "")
+    return await fetchall(sql)
+
+
+async def update_account_last_used(account_id: int) -> None:
+    await execute(
+        "UPDATE accounts SET last_used=datetime('now') WHERE id=?", (account_id,)
+    )
+
+
+async def delete_account(account_id: int) -> None:
+    await execute("DELETE FROM accounts WHERE id=?", (account_id,))
+
+
+# ── Settings ───────────────────────────────────────────────────────────
+
+
+async def set_setting(account_id: int, key: str, value: Any) -> None:
+    await execute(
+        "INSERT OR REPLACE INTO bot_settings (account_id, key, value) VALUES (?,?,?)",
+        (account_id, key, json.dumps(value)),
+    )
+
+
+async def get_setting(account_id: int, key: str, default: Any = None) -> Any:
+    row = await fetchone(
+        "SELECT value FROM bot_settings WHERE account_id=? AND key=?", (account_id, key)
+    )
+    return json.loads(row["value"]) if row else default
+
+
+async def get_all_settings(account_id: int) -> dict:
+    rows = await fetchall(
+        "SELECT key, value FROM bot_settings WHERE account_id=?", (account_id,)
+    )
+    return {r["key"]: json.loads(r["value"]) for r in rows}
+
+
+# ── Keywords & Lists ───────────────────────────────────────────────────
+
+
+async def set_keywords(account_id: int, keywords: list[str]) -> None:
+    async with aiosqlite.connect(_db_path()) as db:
+        await db.execute("DELETE FROM keywords WHERE account_id=?", (account_id,))
+        await db.executemany(
+            "INSERT INTO keywords (account_id, keyword) VALUES (?,?)",
+            [(account_id, kw) for kw in keywords],
+        )
+        await db.commit()
+
+
+async def get_keywords(account_id: int) -> list[str]:
+    rows = await fetchall(
+        "SELECT keyword FROM keywords WHERE account_id=?", (account_id,)
+    )
+    return [r["keyword"] for r in rows]
+
+
+async def set_x_lists(account_id: int, urls: list[str]) -> None:
+    async with aiosqlite.connect(_db_path()) as db:
+        await db.execute("DELETE FROM x_lists WHERE account_id=?", (account_id,))
+        await db.executemany(
+            "INSERT INTO x_lists (account_id, list_url) VALUES (?,?)",
+            [(account_id, url) for url in urls],
+        )
+        await db.commit()
+
+
+async def get_x_lists(account_id: int) -> list[str]:
+    rows = await fetchall(
+        "SELECT list_url FROM x_lists WHERE account_id=?", (account_id,)
+    )
+    return [r["list_url"] for r in rows]
+
+
+# ── Proxies ────────────────────────────────────────────────────────────
+
+
