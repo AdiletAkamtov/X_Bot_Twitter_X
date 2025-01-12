@@ -254,3 +254,132 @@ async def get_x_lists(account_id: int) -> list[str]:
 # ── Proxies ────────────────────────────────────────────────────────────
 
 
+async def add_proxy(url: str, ptype: str = "http") -> int:
+    return await execute(
+        "INSERT OR REPLACE INTO proxies (url, ptype) VALUES (?,?)", (url, ptype)
+    )
+
+
+async def get_proxies(active_only: bool = True) -> list[dict]:
+    sql = "SELECT * FROM proxies"
+    if active_only:
+        sql += " WHERE active=1 ORDER BY fail_count ASC, last_used ASC"
+    return await fetchall(sql)
+
+
+async def mark_proxy_failed(proxy_id: int) -> None:
+    await execute("UPDATE proxies SET fail_count=fail_count+1 WHERE id=?", (proxy_id,))
+
+
+async def reset_proxy_fails(proxy_id: int) -> None:
+    await execute(
+        "UPDATE proxies SET fail_count=0, last_used=datetime('now') WHERE id=?",
+        (proxy_id,),
+    )
+
+
+# ── Posts log ──────────────────────────────────────────────────────────
+
+
+async def log_post(
+    account_id: int,
+    post_id: str,
+    post_url: str,
+    post_text: str,
+    comment_id: str,
+    comment_text: str,
+    reply_text: str,
+    reply_variant2: str,
+    ai_provider: str,
+    sleep_seconds: float = 0.0,
+) -> int:
+    return await execute(
+        """INSERT OR IGNORE INTO posts_log
+           (account_id, post_id, post_url, post_text, comment_id, comment_text,
+            reply_text, reply_variant2, ai_provider, sleep_seconds)
+           VALUES (?,?,?,?,?,?,?,?,?,?)""",
+        (
+            account_id,
+            post_id,
+            post_url,
+            post_text,
+            comment_id,
+            comment_text,
+            reply_text,
+            reply_variant2,
+            ai_provider,
+            sleep_seconds,
+        ),
+    )
+
+
+async def update_log_status(log_id: int, status: str) -> None:
+    posted_at = "datetime('now')" if status == "posted" else "NULL"
+    await execute(
+        f"UPDATE posts_log SET status=?, posted_at={posted_at} WHERE id=?",
+        (status, log_id),
+    )
+
+
+async def was_already_replied(account_id: int, post_id: str, comment_id: str) -> bool:
+    row = await fetchone(
+        "SELECT id FROM posts_log WHERE account_id=? AND post_id=? AND comment_id=? AND status='posted'",
+        (account_id, post_id, comment_id),
+    )
+    return row is not None
+
+
+async def was_replied_any(account_id: int, post_id: str) -> bool:
+    """Returns True if we already replied to this post (to the post itself OR any comment on it)."""
+    row = await fetchone(
+        "SELECT id FROM posts_log WHERE account_id=? AND post_id=? AND status='posted'",
+        (account_id, post_id),
+    )
+    return row is not None
+
+
+# ── Daily stats ────────────────────────────────────────────────────────
+
+
+async def increment_daily_count(account_id: int) -> int:
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    async with aiosqlite.connect(_db_path()) as db:
+        await db.execute(
+            """INSERT INTO daily_stats (account_id, date, count) VALUES (?,?,1)
+               ON CONFLICT(account_id, date) DO UPDATE SET count=count+1""",
+            (account_id, today),
+        )
+        await db.commit()
+        async with db.execute(
+            "SELECT count FROM daily_stats WHERE account_id=? AND date=?",
+            (account_id, today),
+        ) as cur:
+            row = await cur.fetchone()
+            return row[0] if row else 0
+
+
+async def get_daily_count(account_id: int) -> int:
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    row = await fetchone(
+        "SELECT count FROM daily_stats WHERE account_id=? AND date=?",
+        (account_id, today),
+    )
+    return row["count"] if row else 0
+
+
+# ── Allowed users ──────────────────────────────────────────────────────
+
+
+async def add_allowed_user(telegram_id: int, label: str = "") -> None:
+    await execute(
+        "INSERT OR REPLACE INTO allowed_users (telegram_id, label) VALUES (?,?)",
+        (telegram_id, label),
+    )
+
+
+async def remove_allowed_user(telegram_id: int) -> None:
+    await execute("DELETE FROM allowed_users WHERE telegram_id=?", (telegram_id,))
+
+
+async def get_allowed_users() -> list[dict]:
+    return await fetchall("SELECT * FROM allowed_users ORDER BY added_at DESC")
