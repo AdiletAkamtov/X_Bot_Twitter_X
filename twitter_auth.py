@@ -504,3 +504,258 @@ class TwitterAuth:
                     raise
                 await asyncio.sleep(random.uniform(5, 15) * attempt)
         return {}
+
+    async def _post_json(self, url: str, payload: dict, retries: int = 3) -> dict:
+        """GraphQL POST — uses full human simulation + correct KVV transaction-id."""
+        # Full human simulation before every POST — makes real HTTP requests
+        await self._simulate_pre_post_navigation()
+        await self._tracker.wait()
+        from urllib.parse import urlparse
+
+        path = urlparse(url).path
+        self._refresh_request_headers(
+            "https://x.com/compose/tweet", method="POST", path=path
+        )
+        self._tracker.record()
+
+        for attempt in range(1, retries + 1):
+            try:
+                resp = await self._client.post(
+                    url,
+                    json=payload,
+                    headers={"Content-Type": "application/json"},
+                )
+                if resp.status_code == 429:
+                    wait = random.uniform(90, 200) * attempt
+                    logger.warning(f"[{self.account_id}] 429 POST — wait {wait:.0f}s")
+                    await asyncio.sleep(wait)
+                    continue
+                if resp.status_code == 226:
+                    body = resp.json() if resp.content else {}
+                    msg = (body.get("errors") or [{}])[0].get("message", "")[:120]
+                    logger.error(f"[{self.account_id}] 226 anti-bot: {msg}")
+                    await asyncio.sleep(
+                        random.uniform(35 * 60, 65 * 60)
+                    )  # 35–65 минут охлаждения
+                    return body
+                resp.raise_for_status()
+                return resp.json()
+            except Exception as e:
+                code = getattr(getattr(e, "response", None), "status_code", 0)
+                logger.error(
+                    f"HTTP {code or 'ERR'} POST attempt {attempt}: {url} — {e}"
+                )
+                if attempt == retries:
+                    raise
+                await asyncio.sleep(random.uniform(8, 25) * attempt)
+        return {}
+
+    # ── Session verification ───────────────────────────────────────────
+
+    async def verify_session(self) -> Optional[str]:
+        """Returns screen_name if session valid, else None.
+
+        FIX: Now also extracts and stores the real user_id for twid cookie.
+        After first successful verification, rebuilds the client with the correct twid.
+        """
+        try:
+            await asyncio.sleep(random.uniform(0.5, 1.5))
+            resp = await self._client.get(
+                "https://x.com/i/api/1.1/account/settings.json"
+            )
+            logger.debug(f"settings.json -> HTTP {resp.status_code}")
+            if resp.status_code == 200:
+                data = resp.json()
+                username = data.get("screen_name")
+                if username:
+                    logger.debug(f"Session OK via settings.json: @{username}")
+                    return username
+                else:
+                    logger.debug(
+                        f"settings.json 200 but no screen_name: {str(data)[:200]}"
+                    )
+            elif resp.status_code in (401, 403):
+                logger.warning(
+                    f"Session invalid (HTTP {resp.status_code}) — cookie expired or revoked"
+                )
+                return None
+            elif resp.status_code == 326:
+                logger.warning("HTTP 326 — account locked/challenge required")
+                return None
+            elif resp.status_code == 404:
+                # 404 on settings.json = X doesn't recognise these cookies at all
+                # (fully expired / account deleted). Don't treat as "unknown" — fall through.
+                logger.warning(
+                    "settings.json 404 — cookies likely expired, trying fallbacks"
+                )
+            else:
+                logger.warning(f"settings.json unexpected HTTP {resp.status_code}")
+        except Exception as e:
+            logger.debug(f"settings.json failed: {e}")
+
+        try:
+            await asyncio.sleep(random.uniform(1.0, 2.0))
+            resp = await self._client.get(
+                "https://x.com/i/api/1.1/account/multi/list.json"
+            )
+            logger.debug(f"multi/list -> HTTP {resp.status_code}")
+            if resp.status_code in (401, 403):
+                logger.warning(f"multi/list {resp.status_code} — session invalid")
+                return None
+            if resp.status_code == 200:
+                users = resp.json().get("users", [])
+                if users:
+                    username = users[0].get("screen_name")
+                    user_id = str(users[0].get("id_str", ""))
+                    if username:
+                        logger.debug(f"Session OK via multi/list: @{username}")
+                        # FIX: Store real user_id and update twid cookie
+                        if user_id and self._user_id != user_id:
+                            self._user_id = user_id
+                            if self._client:
+                                self._client.cookies.set(
+                                    "twid", f"u%3D{user_id}", domain=".x.com"
+                                )
+                                logger.debug(
+                                    f"[AntiDetect] twid updated to real uid={user_id}"
+                                )
+                        return username
+        except Exception as e:
+            logger.debug(f"multi/list failed: {e}")
+
+        # ── Fallback 2b: notifications/all.json (same-domain, reliable) ────
+        # NOTE: api.twitter.com endpoints are NOT used here — our cookies are
+        # bound to .x.com and are NOT sent to api.twitter.com by httpx.
+        try:
+            await asyncio.sleep(random.uniform(0.8, 1.5))
+            resp = await self._client.get(
+                "https://x.com/i/api/2/notifications/all.json",
+                params={"count": "1"},
+            )
+            logger.debug(f"notifications/all -> HTTP {resp.status_code}")
+            if resp.status_code == 200:
+                # Notifications API doesn't return screen_name directly —
+                # but 200 means session is valid. Extract username from globalObjects if present.
+                data = resp.json()
+                users = data.get("globalObjects", {}).get("users", {})
+                if users:
+                    first_user = next(iter(users.values()))
+                    username = first_user.get("screen_name")
+                    if username:
+                        logger.debug(f"Session OK via notifications: @{username}")
+                        return username
+                # 200 but can't extract username — session is valid, try one more endpoint
+                logger.debug("notifications/all 200 but no username in payload")
+            elif resp.status_code in (401, 403):
+                logger.warning(
+                    f"notifications: session invalid (HTTP {resp.status_code})"
+                )
+                return None
+        except Exception as e:
+            logger.debug(f"notifications/all failed: {e}")
+
+        # ── Fallback 2c: /i/api/1.1/jot/sdk_event.json POST (always 200) ────
+        # As last REST resort, try home timeline (1 tweet) to confirm auth
+        try:
+            await asyncio.sleep(random.uniform(0.5, 1.0))
+            resp = await self._client.get(
+                "https://x.com/i/api/1.1/statuses/home_timeline.json",
+                params={"count": "1", "skip_status": "true"},
+            )
+            logger.debug(f"home_timeline -> HTTP {resp.status_code}")
+            if resp.status_code == 200:
+                data = resp.json()
+                # Extract screen_name from first tweet's user if available
+                if (
+                    data
+                    and isinstance(data, list)
+                    and data[0].get("user", {}).get("screen_name")
+                ):
+                    username = data[0]["user"]["screen_name"]
+                    logger.debug(f"Session OK via home_timeline: @{username}")
+                    return username
+                # At minimum, 200 means auth is valid even without username
+                logger.debug(
+                    "home_timeline 200 — session valid but no username extracted"
+                )
+            elif resp.status_code in (401, 403):
+                logger.warning(
+                    f"home_timeline: session INVALID (HTTP {resp.status_code}) — cookies expired"
+                )
+                return None
+            elif resp.status_code == 404:
+                logger.warning(
+                    "home_timeline 404 — auth_token/ct0 cookies are expired or invalid"
+                )
+                return None
+        except Exception as e:
+            logger.debug(f"home_timeline failed: {e}")
+
+        try:
+            await asyncio.sleep(random.uniform(1.0, 2.0))
+            endpoint = f"{GRAPHQL}/SAMkL5y_N9pmahSw8yy6gw/Viewer"
+            features = json.dumps(
+                {
+                    "rweb_tipjar_consumption_enabled": True,
+                    "responsive_web_graphql_exclude_directive_enabled": True,
+                    "verified_phone_label_enabled": False,
+                    "creator_subscriptions_tweet_preview_api_enabled": True,
+                    "responsive_web_graphql_timeline_navigation_enabled": True,
+                    "responsive_web_graphql_skip_user_profile_image_extensions_enabled": False,
+                    "communities_web_enable_tweet_community_results_fetch": True,
+                    "c9s_tweet_anatomy_moderator_badge_enabled": True,
+                    "articles_preview_enabled": True,
+                    "responsive_web_edit_tweet_api_enabled": True,
+                    "graphql_is_translatable_rweb_tweet_is_translatable_enabled": True,
+                    "view_counts_everywhere_api_enabled": True,
+                    "longform_notetweets_consumption_enabled": True,
+                    "responsive_web_twitter_article_tweet_consumption_enabled": True,
+                    "tweet_awards_web_tipping_enabled": False,
+                    "creator_subscriptions_quote_tweet_preview_enabled": False,
+                    "freedom_of_speech_not_reach_fetch_enabled": True,
+                    "standardized_nudges_misinfo": True,
+                    "tweet_with_visibility_results_prefer_gql_limited_actions_policy_enabled": True,
+                    "rweb_video_timestamps_enabled": True,
+                    "longform_notetweets_rich_text_read_enabled": True,
+                    "longform_notetweets_inline_media_enabled": True,
+                    "responsive_web_enhance_cards_enabled": False,
+                }
+            )
+            data = await self._get(
+                endpoint,
+                params={
+                    "variables": json.dumps({"withCommunitiesMemberships": True}),
+                    "features": features,
+                },
+                retries=1,
+            )
+            result = (
+                data.get("data", {})
+                .get("viewer", {})
+                .get("user_results", {})
+                .get("result", {})
+            )
+            username = result.get("legacy", {}).get("screen_name")
+            user_id = result.get("rest_id", "")
+            if username:
+                # FIX: Store real user_id from GraphQL Viewer
+                if user_id and self._user_id != user_id:
+                    self._user_id = user_id
+                    if self._client:
+                        self._client.cookies.set(
+                            "twid", f"u%3D{user_id}", domain=".x.com"
+                        )
+                        logger.debug(
+                            f"[AntiDetect] twid updated to real uid={user_id} (via Viewer)"
+                        )
+                return username
+        except Exception as e:
+            logger.debug(f"GraphQL Viewer failed: {e}")
+
+        logger.error(
+            "Session verify failed: all methods exhausted. "
+            "Most likely cause: auth_token and/or ct0 cookies are expired. "
+            "Open x.com in Chrome, press F12 → Application → Cookies → x.com, "
+            "copy fresh auth_token and ct0, then update the account in the bot."
+        )
+        return None
