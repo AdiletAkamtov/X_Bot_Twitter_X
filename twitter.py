@@ -848,3 +848,430 @@ class TwitterClient(TwitterAuth):
                     logger.debug("[QueryID] Could not extract queryIds — using known IDs")
                 else:
                     missing = set(_operations) - found
+                    if missing:
+                        logger.debug(f"[QueryID] Not found in bundles: {missing} — using known IDs")
+        except Exception as e:
+            logger.debug(f"[QueryID] Discovery failed: {e}")
+
+    async def get_top_comment(self, tweet: Tweet, sort_by: str = "likes",
+                              own_username: Optional[str] = None) -> Optional[Comment]:
+        import json as _json
+
+        variables = _json.dumps({
+            "focalTweetId": tweet.id,
+            "count": 40,
+            "referrer": "tweet",
+            "with_rux_injections": False,
+            "includePromotedContent": False,
+            "withCommunity": True,
+            "withQuickPromoteEligibilityTweetFields": False,
+            "withBirdwatchNotes": False,
+            "withVoice": False,
+            "withV2Timeline": True,
+        })
+        features = _json.dumps({
+            "articles_preview_enabled": True,
+            "rweb_tipjar_consumption_enabled": False,
+            "responsive_web_graphql_exclude_directive_enabled": True,
+            "verified_phone_label_enabled": False,
+            "responsive_web_graphql_timeline_navigation_enabled": True,
+            "responsive_web_graphql_skip_user_profile_image_extensions_enabled": False,
+            "responsive_web_edit_tweet_api_enabled": True,
+            "graphql_is_translatable_rweb_tweet_is_translatable_enabled": True,
+            "view_counts_everywhere_api_enabled": True,
+            "longform_notetweets_consumption_enabled": True,
+            "tweet_with_visibility_results_prefer_gql_limited_actions_policy_enabled": True,
+            "rweb_video_timestamps_enabled": True,
+            "longform_notetweets_rich_text_read_enabled": True,
+            "longform_notetweets_inline_media_enabled": False,
+            "responsive_web_enhance_cards_enabled": False,
+        })
+        fieldToggles = _json.dumps({
+            "withArticleRichContentState": False,
+            "withArticlePlainText": False,
+            "withGrokAnalyze": False,
+            "withDisallowedReplyControls": False,
+        })
+
+        data = {}
+        for qid in self._TWEET_DETAIL_QUERY_IDS:
+            endpoint = f"{GRAPHQL}/{qid}/TweetDetail"
+            params = {"variables": variables, "features": features, "fieldToggles": fieldToggles}
+            try:
+                result = await self._get(endpoint, params=params)
+                if result:
+                    data = result
+                    break
+            except Exception:
+                continue
+        comments: list[Comment] = []
+        try:
+            instructions = (data.get("data", {})
+                               .get("threaded_conversation_with_injections_v2", {})
+                               .get("instructions", []))
+            for instr in instructions:
+                for entry in instr.get("entries", []):
+                    entry_id = entry.get("entryId", "")
+                    content_entry = entry.get("content", {})
+
+                    if entry_id.startswith("tweet-"):
+                        item = content_entry.get("itemContent", {})
+                        if item.get("itemType") == "TimelineTweet":
+                            t = self._parse_tweet(item.get("tweet_results", {}).get("result", {}))
+                            if t and t.id != tweet.id:
+                                comments.append(Comment(id=t.id, text=t.text,
+                                                        author_username=t.author_username,
+                                                        likes=t.likes, views=t.views,
+                                                        created_at=t.created_at))
+
+                    elif entry_id.startswith("conversationthread-"):
+                        for it in content_entry.get("items", []):
+                            item = it.get("item", {}).get("itemContent", {})
+                            if item.get("itemType") == "TimelineTweet":
+                                t = self._parse_tweet(item.get("tweet_results", {}).get("result", {}))
+                                if t and t.id != tweet.id:
+                                    comments.append(Comment(id=t.id, text=t.text,
+                                                            author_username=t.author_username,
+                                                            likes=t.likes, views=t.views,
+                                                            created_at=t.created_at))
+                        item = content_entry.get("itemContent", {})
+                        if item.get("itemType") == "TimelineTweet":
+                            t = self._parse_tweet(item.get("tweet_results", {}).get("result", {}))
+                            if t and t.id != tweet.id:
+                                comments.append(Comment(id=t.id, text=t.text,
+                                                        author_username=t.author_username,
+                                                        likes=t.likes, views=t.views,
+                                                        created_at=t.created_at))
+
+            logger.debug(f"[comments] tweet={tweet.id} -> {len(comments)} candidates found")
+        except Exception as e:
+            logger.debug(f"Comment parse error: {e}")
+
+        if not comments:
+            return None
+
+        if own_username:
+            own_lower = own_username.lstrip("@").lower()
+            before = len(comments)
+            comments = [c for c in comments if c.author_username.lower() != own_lower]
+            if len(comments) < before:
+                logger.debug(f"[comments] Filtered out {before - len(comments)} own-account comment(s)")
+
+        if not comments:
+            return None
+
+        comments.sort(key=lambda c: c.views if sort_by == "views" else c.likes, reverse=True)
+        return comments[0]
+
+    # ── Post reply ─────────────────────────────────────────────────────
+
+    class _PostUnavailable(Exception):
+        pass
+
+    class _PostRestricted(Exception):
+        pass
+
+    _CREATE_TWEET_QUERY_IDS = [
+        "a1p9RWpkYKBjWv_I3WzS-A",
+        "SoVnbfCycZ7fERGCwpZkYA",
+        "tTsjMKyhajZvK4q76mpIBg",
+    ]
+
+    async def post_reply(self, reply_text: str, in_reply_to_tweet_id: str,
+                         tweet_url: Optional[str] = None) -> Optional[str]:
+        try:
+            from browser_poster import get_browser_poster
+            poster = await get_browser_poster()
+            logger.info(f"[Acc {self.account_id}] 🌐 Browser → reply to {in_reply_to_tweet_id}")
+            tweet_id = await poster.post_reply(
+                account_id=self.account_id,
+                auth_token=self._auth_token,
+                ct0=self._ct0,
+                reply_text=reply_text,
+                in_reply_to_id=in_reply_to_tweet_id,
+            )
+            if tweet_id:
+                logger.success(f"[Acc {self.account_id}] ✅ Browser posted → {tweet_id}")
+            else:
+                logger.warning(f"[Acc {self.account_id}] Browser не смог опубликовать")
+            return tweet_id
+        except Exception as e:
+            logger.error(f"[Acc {self.account_id}] Browser post error: {e}")
+            return None
+
+    # ── Like tweet (Фаза 3 — FavoriteTweet GraphQL) ───────────────────
+
+    # Known queryIds for FavoriteTweet
+    _FAVORITE_TWEET_QUERY_IDS = [
+        "lI07N6Otwv1PhnEgXILM7A",  # актуальный 2024-2026
+    ]
+
+    async def like_tweet(self, tweet_id: str) -> bool:
+        """
+        Ставит лайк через GraphQL мутацию FavoriteTweet.
+        Использует существующий механизм _post_json (KVV/HMAC-SHA256 подпись).
+
+        Returns:
+            True если лайк поставлен (или уже был), False при ошибке.
+        """
+        from urllib.parse import urlparse
+
+        for qid in self._FAVORITE_TWEET_QUERY_IDS:
+            endpoint = f"{GRAPHQL}/{qid}/FavoriteTweet"
+            referer = f"https://x.com/i/status/{tweet_id}"
+
+            self._refresh_request_headers(
+                referer, method="POST", path=urlparse(endpoint).path
+            )
+
+            payload = {
+                "variables": {"tweet_id": tweet_id},
+                "queryId": qid,
+            }
+
+            try:
+                data = await self._post_json(endpoint, payload)
+
+                # Успех: {"data": {"favorite_tweet": "Done"}}
+                if data.get("data", {}).get("favorite_tweet") == "Done":
+                    logger.success(f"[Acc {self.account_id}] ❤️  Liked tweet {tweet_id}")
+                    return True
+
+                errors = data.get("errors", [])
+                for err in errors:
+                    code = err.get("code")
+                    msg  = err.get("message", "")[:100]
+
+                    if code == 139:
+                        # Уже лайкнуто — не ошибка
+                        logger.debug(f"[Acc {self.account_id}] Tweet {tweet_id} already liked")
+                        return True
+
+                    if code == 179:
+                        logger.warning(f"[Acc {self.account_id}] Like restricted on {tweet_id}: {msg}")
+                        return False
+
+                    if code in (32, 135, 326):
+                        logger.error(f"[Acc {self.account_id}] Auth error {code} on like: {msg}")
+                        return False
+
+                    if code == 226:
+                        logger.error(f"[Acc {self.account_id}] Anti-bot 226 on like")
+                        return False
+
+                    logger.warning(f"[Acc {self.account_id}] Like error {code}: {msg}")
+
+                # Нет known error — пробуем следующий queryId
+                logger.debug(f"[Acc {self.account_id}] FavoriteTweet qid={qid} gave no 'Done', trying next")
+                continue
+
+            except Exception as e:
+                logger.error(f"[Acc {self.account_id}] like_tweet({tweet_id}) error: {e}")
+                continue
+
+        logger.error(f"[Acc {self.account_id}] All FavoriteTweet queryIds exhausted for {tweet_id}")
+        return False
+
+    # ── Legacy REST methods (kept for reference) ──────────────────────
+
+    async def _post_reply_v1(self, reply_text: str, in_reply_to_tweet_id: str,
+                              tweet_url: Optional[str] = None) -> Optional[str]:
+        url = "https://x.com/i/api/1.1/statuses/update.json"
+        referer = tweet_url or "https://x.com/home"
+        from urllib.parse import urlparse
+        self._refresh_request_headers(referer, method="POST", path=urlparse(url).path)
+        form_data = {
+            "status": reply_text,
+            "in_reply_to_status_id": in_reply_to_tweet_id,
+            "auto_populate_reply_metadata": "true",
+            "batch_mode": "off",
+            "tweet_mode": "extended",
+        }
+        try:
+            data = await self._post_form(url, form_data)
+            result = self._parse_v1_response(data, "v1.1")
+            return result
+        except TwitterClient._PostUnavailable:
+            raise
+        except Exception as e:
+            logger.debug(f"[Acc {self.account_id}] v1.1 exception: {e}")
+            return None
+
+    async def _post_reply_v1_alt(self, reply_text: str, in_reply_to_tweet_id: str,
+                                   tweet_url: Optional[str] = None) -> Optional[str]:
+        url = "https://x.com/i/api/1.1/statuses/update.json"
+        referer = tweet_url or "https://x.com/home"
+        from urllib.parse import urlparse
+        self._refresh_request_headers(referer, method="POST", path=urlparse(url).path)
+        form_data = {
+            "status": reply_text,
+            "in_reply_to_status_id": in_reply_to_tweet_id,
+            "auto_populate_reply_metadata": "true",
+            "include_reply_count": "1",
+            "include_user_entities": "false",
+            "tweet_mode": "extended",
+            "ext": "mediaStats,highlightedLabel",
+        }
+        try:
+            data = await self._post_form(url, form_data)
+            result = self._parse_v1_response(data, "v1.1-alt")
+            return result
+        except TwitterClient._PostUnavailable:
+            raise
+        except Exception as e:
+            logger.debug(f"[Acc {self.account_id}] v1.1-alt exception: {e}")
+            return None
+
+    _SKIP_POST_ERRORS = {
+        144: "post not found (deleted)",
+        179: "reply not authorized (private/restricted)",
+        385: "reply to deleted post",
+        386: "too many replies in thread",
+        453: "tweet creation restricted (locked feature)",
+    }
+    _ACCOUNT_ERRORS = {
+        32:  "auth failed (bad token)",
+        64:  "account suspended",
+        135: "timestamp out of bounds",
+        215: "bad auth data",
+        261: "app suspended",
+        326: "account locked",
+    }
+
+    def _parse_v1_response(self, data: dict, method_name: str) -> Optional[str]:
+        tweet_id = data.get("id_str") or str(data.get("id", ""))
+        if tweet_id and tweet_id not in ("", "0"):
+            logger.success(f"[Acc {self.account_id}] {method_name} replied → {tweet_id}")
+            return tweet_id
+
+        errors = data.get("errors", [])
+        for err in errors:
+            code = err.get("code", 0)
+            msg  = err.get("message", "")[:200]
+
+            if code == 187:
+                logger.warning(f"[Acc {self.account_id}] {method_name}: duplicate tweet — skipping")
+                return None
+
+            if code == 226:
+                logger.warning(f"[Acc {self.account_id}] {method_name} anti-bot 226 — skipping")
+                return None
+
+            if code in self._SKIP_POST_ERRORS:
+                reason = self._SKIP_POST_ERRORS[code]
+                logger.info(
+                    f"[Acc {self.account_id}] {method_name}: post unavailable "
+                    f"(code {code} — {reason})"
+                )
+                if code == 179:
+                    raise TwitterClient._PostRestricted(f"code {code} — {reason}")
+                raise TwitterClient._PostUnavailable(f"code {code} — {reason}")
+
+            if code in self._ACCOUNT_ERRORS:
+                reason = self._ACCOUNT_ERRORS[code]
+                logger.error(
+                    f"[Acc {self.account_id}] {method_name}: ACCOUNT ERROR "
+                    f"(code {code} — {reason}): {msg}"
+                )
+                return None
+
+            logger.warning(f"[Acc {self.account_id}] {method_name} error code={code}: {msg}")
+
+        if errors:
+            return None
+        if data:
+            logger.debug(f"[{method_name}] Unexpected response (no id_str, no errors): {str(data)[:300]}")
+        return None
+
+    async def _post_reply_graphql(self, reply_text: str, in_reply_to_tweet_id: str,
+                                   tweet_url: Optional[str] = None) -> Optional[str]:
+        features = {
+            "communities_web_enable_tweet_community_results_fetch": True,
+            "c9s_tweet_anatomy_moderator_badge_enabled": True,
+            "responsive_web_edit_tweet_api_enabled": True,
+            "graphql_is_translatable_rweb_tweet_is_translatable_enabled": True,
+            "view_counts_everywhere_api_enabled": True,
+            "longform_notetweets_consumption_enabled": True,
+            "responsive_web_twitter_article_tweet_consumption_enabled": True,
+            "tweet_awards_web_tipping_enabled": False,
+            "creator_subscriptions_quote_tweet_preview_enabled": False,
+            "longform_notetweets_rich_text_read_enabled": True,
+            "longform_notetweets_inline_media_enabled": True,
+            "articles_preview_enabled": True,
+            "rweb_video_timestamps_enabled": True,
+            "rweb_tipjar_consumption_enabled": True,
+            "responsive_web_graphql_exclude_directive_enabled": True,
+            "verified_phone_label_enabled": False,
+            "freedom_of_speech_not_reach_fetch_enabled": True,
+            "standardized_nudges_misinfo": True,
+            "tweet_with_visibility_results_prefer_gql_limited_actions_policy_enabled": True,
+            "responsive_web_graphql_skip_user_profile_image_extensions_enabled": False,
+            "responsive_web_graphql_timeline_navigation_enabled": True,
+            "creator_subscriptions_tweet_preview_api_enabled": True,
+            "responsive_web_enhance_cards_enabled": False,
+            "tweetypie_unmention_optimization_enabled": True,
+            "premium_content_api_read_enabled": False,
+            "responsive_web_text_conversations_enabled": False,
+        }
+
+        compose_referer = tweet_url or "https://x.com/compose/tweet"
+
+        for qid in self._CREATE_TWEET_QUERY_IDS:
+            endpoint = f"{GRAPHQL}/{qid}/CreateTweet"
+            from urllib.parse import urlparse
+            self._refresh_request_headers(compose_referer, method="POST",
+                                          path=urlparse(endpoint).path)
+            payload = {
+                "variables": {
+                    "tweet_text": reply_text,
+                    "reply": {
+                        "in_reply_to_tweet_id": in_reply_to_tweet_id,
+                        "exclude_reply_user_ids": [],
+                    },
+                    "dark_request": False,
+                    "media": {"media_entities": [], "possibly_sensitive": False},
+                    "semantic_annotation_ids": [],
+                },
+                "features": features,
+                "queryId": qid,
+            }
+            try:
+                data = await self._post_json(endpoint, payload)
+                errors = data.get("errors", [])
+                for err in errors:
+                    code = err.get("code")
+                    msg  = err.get("message", "")[:120]
+                    if code == 226:
+                        cooldown = random.uniform(35 * 60, 65 * 60)
+                        logger.error(
+                            f"[Acc {self.account_id}] GraphQL 226 anti-bot — "
+                            f"cooling off {cooldown/60:.0f} min before next action"
+                        )
+                        await asyncio.sleep(cooldown)
+                        return None
+                    if code == 179:
+                        logger.info(f"[Acc {self.account_id}] GraphQL 179 — reply restricted, skipping")
+                        return None
+                    if code in (32, 135, 326):
+                        logger.error(
+                            f"[Acc {self.account_id}] GraphQL blocked "
+                            f"(code {code}): {msg}"
+                        )
+                        return None
+                    logger.warning(f"[Acc {self.account_id}] GraphQL error {code}: {msg}")
+                new_tweet = (data.get("data", {}).get("create_tweet", {})
+                                .get("tweet_results", {}).get("result", {}))
+                tweet_id = (new_tweet.get("rest_id")
+                            or new_tweet.get("legacy", {}).get("id_str"))
+                if tweet_id:
+                    if qid != self._CREATE_TWEET_QUERY_IDS[0]:
+                        self._CREATE_TWEET_QUERY_IDS.remove(qid)
+                        self._CREATE_TWEET_QUERY_IDS.insert(0, qid)
+                    logger.success(f"[Acc {self.account_id}] GraphQL replied → {tweet_id}")
+                    return tweet_id
+            except Exception as e:
+                logger.debug(f"[GraphQL:{qid}] failed: {e}")
+                await asyncio.sleep(random.uniform(3, 8))
+
+        logger.error(f"[Acc {self.account_id}] All reply methods failed")
+        return None
