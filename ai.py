@@ -223,3 +223,228 @@ def _get_groq_client():
 def _get_gemini_model(system_prompt: str):
     import google.generativeai as genai
 
+    settings = get_settings()
+    if not settings.gemini_api_key:
+        raise ValueError("Gemini API key not configured. Go to 'API Keys' tab.")
+    cache_key = (settings.gemini_api_key[:16] + system_prompt)[:80]
+    if cache_key not in _gemini_model_cache:
+        genai.configure(api_key=settings.gemini_api_key)
+        for model_name in [
+            "gemini-2.0-flash",
+            "gemini-1.5-flash-latest",
+            "gemini-1.5-flash",
+        ]:
+            try:
+                m = genai.GenerativeModel(
+                    model_name=model_name, system_instruction=system_prompt
+                )
+                _gemini_model_cache[cache_key] = m
+                _gemini_model_cache[cache_key + ":name"] = model_name
+                logger.debug(f"[AI:gemini] Using model: {model_name}")
+                break
+            except Exception as e:
+                logger.debug(f"[AI:gemini] Model {model_name} unavailable: {e}")
+        if cache_key not in _gemini_model_cache:
+            raise ValueError(
+                "No working Gemini model found. Check your API key and quota."
+            )
+    return _gemini_model_cache[cache_key]
+
+
+def _build_prompt(post_text: str, comment_text: Optional[str]) -> str:
+    if comment_text:
+        return (
+            f"[Context - original post]:\n{post_text}\n\n"
+            f"[Reply to THIS comment]:\n{comment_text}\n\n"
+            f"Write a short reply to the comment above. "
+            f"Do NOT start with @mentions. Do NOT address the original post author."
+        )
+    return f"Post:\n{post_text}\n\nWrite your reply:"
+
+
+async def _generate_openai(
+    post_text: str, comment_text: Optional[str], system_prompt: str
+) -> str:
+    client = _get_openai_client()
+    response = await client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": _build_prompt(post_text, comment_text)},
+        ],
+        max_tokens=80,
+        temperature=0.85,
+        top_p=0.9,
+        frequency_penalty=0.3,
+        presence_penalty=0.2,
+    )
+    return response.choices[0].message.content.strip()
+
+
+async def _generate_gemini(
+    post_text: str, comment_text: Optional[str], system_prompt: str
+) -> str:
+    import google.generativeai as genai
+
+    model = _get_gemini_model(system_prompt)
+    loop = asyncio.get_running_loop()
+    response = await loop.run_in_executor(
+        None,
+        lambda: model.generate_content(
+            _build_prompt(post_text, comment_text),
+            generation_config={
+                "max_output_tokens": 80,
+                "temperature": 0.85,
+                "top_p": 0.9,
+            },
+        ),
+    )
+    return response.text.strip()
+
+
+async def _generate_perplexity(
+    post_text: str, comment_text: Optional[str], system_prompt: str
+) -> str:
+    client = _get_perplexity_client()
+    response = await client.chat.completions.create(
+        model="sonar",
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": _build_prompt(post_text, comment_text)},
+        ],
+        max_tokens=80,
+        temperature=0.85,
+        top_p=0.9,
+    )
+    return response.choices[0].message.content.strip()
+
+
+async def _generate_groq(
+    post_text: str, comment_text: Optional[str], system_prompt: str
+) -> str:
+    client = _get_groq_client()
+    response = await client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": _build_prompt(post_text, comment_text)},
+        ],
+        max_tokens=80,
+        temperature=0.85,
+        top_p=0.9,
+    )
+    return response.choices[0].message.content.strip()
+
+
+async def generate_reply(
+    post_text: str,
+    comment_text: Optional[str] = None,
+    provider: Optional[Provider] = None,
+    system_prompt: Optional[str] = None,
+    # Фаза 4: параметры для динамического CRITIC_PROMPT
+    topic: Optional[str] = None,
+    target_reference: Optional[str] = None,
+    persona: Optional[str] = None,
+) -> tuple[str, Provider]:
+    """
+    Generate a reply using the selected provider.
+
+    Фаза 4: если переданы topic/target_reference/persona — использует CRITIC_PROMPT_TEMPLATE
+    вместо дефолтного промпта Маркуса.
+
+    Args:
+        post_text:        Текст твита для ответа
+        comment_text:     Текст комментария (если отвечаем на коммент, а не на пост)
+        provider:         AI провайдер (openai/gemini/perplexity/groq)
+        system_prompt:    Явный системный промпт (приоритет над topic/persona)
+        topic:            Тема для CRITIC_PROMPT (Фаза 4)
+        target_reference: Ссылка/ресурс для рекомендации (Фаза 4)
+        persona:          Роль AI (Фаза 4)
+
+    Returns:
+        (reply_text, provider_used)
+    """
+    settings = get_settings()
+
+    if provider is None:
+        provider = settings.default_ai_provider  # type: ignore
+
+    # ── Выбор промпта (приоритет: explicit > critic > comment > default) ──
+    if system_prompt is None:
+        if topic:
+            # Фаза 4: динамический CRITIC_PROMPT с плейсхолдерами
+            system_prompt = build_critic_prompt(
+                topic=topic,
+                target_reference=target_reference or "",
+                persona=persona or "Senior Backend Engineer",
+            )
+            logger.debug(
+                f"[AI] Using CRITIC_PROMPT | topic={topic!r} | ref={target_reference!r}"
+            )
+        elif comment_text:
+            system_prompt = COMMENT_SYSTEM_PROMPT
+        else:
+            system_prompt = DEFAULT_SYSTEM_PROMPT
+
+    # Всегда добавляем English-only prefix
+    if not system_prompt.startswith("CRITICAL INSTRUCTION"):
+        system_prompt = _ENGLISH_ONLY_PREFIX + system_prompt
+
+    configured: dict[str, bool] = {
+        "openai": bool(settings.openai_api_key),
+        "gemini": bool(settings.gemini_api_key),
+        "perplexity": bool(settings.perplexity_api_key),
+        "groq": bool(settings.groq_api_key),
+    }
+
+    logger.debug(
+        f"[AI] Provider: {provider} | Keys: {[p for p, ok in configured.items() if ok]}"
+    )
+
+    if not configured.get(provider, False):
+        raise RuntimeError(
+            f"API key for '{provider}' is not configured.\n"
+            f"Go to 'API Keys' tab in the GUI, add the key and click Save."
+        )
+
+    async def _try_generate(prov: str) -> str:
+        if prov == "openai":
+            return await _generate_openai(post_text, comment_text, system_prompt)
+        elif prov == "gemini":
+            return await _generate_gemini(post_text, comment_text, system_prompt)
+        elif prov == "perplexity":
+            return await _generate_perplexity(post_text, comment_text, system_prompt)
+        else:
+            return await _generate_groq(post_text, comment_text, system_prompt)
+
+    try:
+        text = await _try_generate(provider)
+        text = text.strip("\"'").strip()
+
+        # English-only guard
+        if not text.upper().startswith("SKIP") and not _is_english_reply(text):
+            logger.warning(f"[AI:{provider}] Non-English reply — retrying")
+            text = await _try_generate(provider)
+            text = text.strip("\"'").strip()
+            if not _is_english_reply(text):
+                logger.error(f"[AI:{provider}] Still non-English — skipping")
+                return AI_SKIP, provider
+
+        # Off-topic guard
+        if text.upper().startswith("SKIP"):
+            logger.info(f"[AI:{provider}] Off-topic — SKIP")
+            return AI_SKIP, provider
+
+        if len(text) > 280:
+            chunk = text[:277]
+            cut = max(chunk.rfind("."), chunk.rfind("!"), chunk.rfind("?"))
+            text = chunk[: cut + 1].strip() if cut > 60 else chunk.strip()
+            logger.warning(f"[AI:{provider}] Truncated to {len(text)} chars")
+
+        logger.success(f"[AI:{provider}] Generated reply ({len(text)} chars)")
+        return text, provider
+
+    except Exception as e:
+        err_str = str(e)
+        logger.error("[AI:{}] Failed: {}", provider, err_str[:300])
+        raise RuntimeError(f"[AI:{provider}] {err_str}") from e
