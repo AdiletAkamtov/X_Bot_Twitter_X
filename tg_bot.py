@@ -2945,6 +2945,1479 @@ def register_handlers(app: Application) -> None:
     app.add_handler(CallbackQueryHandler(on_callback))
 
 
+            ),
+
+        )
+
+
+
+
+
+async def _handle_like_only(log_id: int, query, ctx) -> None:
+
+    item = _find_pending(log_id) or _hitl_store.get(log_id)
+
+    if not item:
+
+        await query.edit_message_text("⚠️ Запрос устарел.")
+
+        return
+
+    tweet = item.get("tweet")
+
+    tweet_id = tweet.id if tweet else None
+
+    if not tweet_id:
+
+        await query.edit_message_text("⚠️ Нет ID твита.")
+
+        return
+
+
+
+    await query.edit_message_text("⏳ Ставим лайк...", reply_markup=None)
+
+    try:
+
+        from proxy import proxy_manager as _pm
+
+        from twitter import TwitterClient as _TC
+
+
+
+        acc = await get_account(item["account_id"])
+
+        proxy = await _pm.get_proxy_for_account(acc.get("proxy_id")) if acc else None
+
+        async with _TC(
+
+            account_id=item["account_id"],
+
+            auth_token_enc=acc["auth_token"],
+
+            ct0_enc=acc["ct0"],
+
+            proxy=proxy,
+
+        ) as client:
+
+            success = await client.like_tweet(tweet_id)
+
+        if success:
+
+            await update_log_status(log_id, "liked_only")
+
+            _remove_pending(item["account_id"], log_id)
+
+            _pop_hitl_item(log_id)
+
+            await query.edit_message_text(
+
+                "❤️ Лайк поставлен.",
+
+                reply_markup=InlineKeyboardMarkup(
+
+                    [[InlineKeyboardButton("🏠 Меню", callback_data="menu:main")]]
+
+                ),
+
+            )
+
+        else:
+
+            await query.edit_message_text(
+
+                "⚠️ Лайк не удался.",
+
+                reply_markup=InlineKeyboardMarkup(
+
+                    [[InlineKeyboardButton("🏠 Меню", callback_data="menu:main")]]
+
+                ),
+
+            )
+
+    except Exception as e:
+
+        logger.error(f"[TG:like] {e}")
+
+        await query.edit_message_text(f"❌ Ошибка: {str(e)[:200]}")
+
+
+
+
+
+async def _handle_regen(log_id: int, query, ctx) -> None:
+
+    item = _find_pending(log_id)
+
+    if not item:
+
+        await query.edit_message_text("⚠️ Запрос устарел.")
+
+        return
+
+    await query.edit_message_text("🔄 Генерируем...")
+
+    from ai import REPLY_SKIP as _SKIP
+
+    from ai import generate_reply
+
+
+
+    try:
+
+        st = await get_all_settings(item["account_id"])
+
+        prompt = st.get("system_prompt", BotDefaults.system_prompt)
+
+        prov = st.get("ai_provider", None)
+
+        r1 = r2 = _SKIP
+
+        for _ in range(3):
+
+            r1, prov = await generate_reply(
+
+                post_text=item["tweet"].text,
+
+                comment_text=item["comment"].text if item.get("comment") else None,
+
+                provider=prov,
+
+                system_prompt=prompt,
+
+            )
+
+            r2, _ = await generate_reply(
+
+                post_text=item["tweet"].text,
+
+                comment_text=item["comment"].text if item.get("comment") else None,
+
+                provider=prov,
+
+                system_prompt=prompt,
+
+            )
+
+            if r1 != _SKIP and r2 != _SKIP:
+
+                break
+
+        if r1 == _SKIP or r2 == _SKIP:
+
+            await query.edit_message_text(
+
+                "🤖 AI пропускает этот пост.",
+
+                reply_markup=InlineKeyboardMarkup(
+
+                    [[InlineKeyboardButton("❌ Скип", callback_data=f"skip:{log_id}")]]
+
+                ),
+
+            )
+
+            return
+
+    except Exception as e:
+
+        await query.edit_message_text(f"❌ Ошибка: {e}")
+
+        return
+
+
+
+    item["reply_text"] = r1
+
+    item["reply_variant2"] = r2
+
+    item["provider"] = prov
+
+    from db import execute
+
+
+
+    await execute(
+
+        "UPDATE posts_log SET reply_text=?, reply_variant2=? WHERE id=?",
+
+        (r1, r2, log_id),
+
+    )
+
+    tweet = item["tweet"]
+
+    post_url = item.get("post_url", "")
+
+    await query.edit_message_text(
+
+        f"🔄 *Перегенерировано* `[{prov}]`\n\n"
+
+        f"@{_md_escape(tweet.author_username)}: {_md_escape(tweet.text[:150])}\n"
+
+        f"[Открыть пост]({post_url})\n\n"
+
+        f"*Вариант 1:*\n{_md_escape(r1)}\n\n"
+
+        f"*Вариант 2:*\n{_md_escape(r2)}",
+
+        parse_mode="Markdown",
+
+        disable_web_page_preview=True,
+
+        reply_markup=InlineKeyboardMarkup(
+
+            [
+
+                [
+
+                    InlineKeyboardButton(
+
+                        "✅ Вариант 1", callback_data=f"post1:{log_id}"
+
+                    ),
+
+                    InlineKeyboardButton(
+
+                        "✅ Вариант 2", callback_data=f"post2:{log_id}"
+
+                    ),
+
+                ],
+
+                [
+
+                    InlineKeyboardButton("🔄 Ещё раз", callback_data=f"regen:{log_id}"),
+
+                    InlineKeyboardButton("❤️ Лайк", callback_data=f"likeonly:{log_id}"),
+
+                    InlineKeyboardButton("❌ Скип", callback_data=f"skip:{log_id}"),
+
+                ],
+
+            ]
+
+        ),
+
+    )
+
+
+
+
+
+# ─────────────────────────────────────────────
+
+# ТЕСТ
+
+# ─────────────────────────────────────────────
+
+
+
+
+
+async def _handle_test(acc_id: int, query) -> None:
+
+    from ai import REPLY_SKIP as _SKIP
+
+    from ai import generate_reply
+
+    from config import compose_delay, read_delay
+
+    from db import log_post, was_replied_any
+
+    from proxy import proxy_manager
+
+    from twitter import TwitterClient
+
+
+
+    await query.edit_message_text("🧪 Запускаем тест...")
+
+    acc = await get_account(acc_id)
+
+    if not acc:
+
+        await query.edit_message_text("❌ Аккаунт не найден.", reply_markup=_back())
+
+        return
+
+
+
+    st = await get_all_settings(acc_id)
+
+    mode = st.get("search_mode", BotDefaults.search_mode)
+
+    min_likes = st.get("min_likes", BotDefaults.min_likes)
+
+    min_rt = st.get("min_retweets", BotDefaults.min_retweets)
+
+    max_age = st.get("max_age_min", BotDefaults.max_post_age_minutes)
+
+    sort_by = st.get("comment_sort", BotDefaults.comment_sort)
+
+    auto_publish = st.get("auto_publish", BotDefaults.auto_publish)
+
+    system_prompt = st.get("system_prompt", BotDefaults.system_prompt)
+
+    ai_provider = st.get("ai_provider", None)
+
+    reply_mode = st.get("reply_mode", "hybrid")
+
+
+
+    proxy = await proxy_manager.get_proxy_for_account(acc.get("proxy_id"))
+
+    client = TwitterClient(
+
+        account_id=acc_id,
+
+        auth_token_enc=acc["auth_token"],
+
+        ct0_enc=acc["ct0"],
+
+        proxy=proxy,
+
+    )
+
+    try:
+
+        await client.__aenter__()
+
+        username = await client.verify_session()
+
+        if not username:
+
+            await query.edit_message_text(
+
+                "❌ Сессия недействительна.", reply_markup=_back()
+
+            )
+
+            return
+
+
+
+        await query.edit_message_text(f"🧪 @{username} ✅\n🔍 Ищем посты ({mode})...")
+
+
+
+        tweets = []
+
+        if mode == "keywords":
+
+            kws = await get_keywords(acc_id)
+
+            if not kws:
+
+                await query.edit_message_text(
+
+                    "⚠️ Ключевые слова не заданы.", reply_markup=_back()
+
+                )
+
+                return
+
+            kw = random.choice(kws)
+
+            tweets = await client.search_tweets(
+
+                kw,
+
+                min_likes=min_likes,
+
+                min_retweets=min_rt,
+
+                max_age_minutes=max_age,
+
+                limit=10,
+
+            )
+
+        elif mode == "list":
+
+            from db import get_x_lists
+
+
+
+            urls = await get_x_lists(acc_id)
+
+            if not urls:
+
+                await query.edit_message_text(
+
+                    "⚠️ Списки X не заданы.", reply_markup=_back()
+
+                )
+
+                return
+
+            for url in urls[:3]:
+
+                t = await client.get_list_tweets(url, min_likes=min_likes, limit=10)
+
+                tweets.extend(t)
+
+                if tweets:
+
+                    break
+
+        else:
+
+            tweets = await client.get_recommended_tweets(min_likes=min_likes, limit=10)
+
+
+
+        if not tweets:
+
+            await query.edit_message_text(
+
+                "⚠️ Постов не найдено. Снизь мин. лайки.", reply_markup=_back()
+
+            )
+
+            return
+
+
+
+        fresh = [t for t in tweets[:10] if not await was_replied_any(acc_id, t.id)]
+
+        if not fresh:
+
+            await query.edit_message_text(
+
+                "⚠️ На все найденные посты уже ответили.", reply_markup=_back()
+
+            )
+
+            return
+
+
+
+        candidates = (
+
+            list(fresh[:10]) if mode == "keywords" else [random.choice(fresh[:5])]
+
+        )
+
+        random.shuffle(candidates)
+
+
+
+        tweet = comment = reply_text = prov = None
+
+        skipped = 0
+
+
+
+        for _cand in candidates:
+
+            tweet = _cand
+
+            post_url = f"https://x.com/{tweet.author_username}/status/{tweet.id}"
+
+            comment = None
+
+            if reply_mode == "hybrid" and random.random() < 0.5:
+
+                comment = await client.get_top_comment(tweet, sort_by=sort_by)
+
+            await query.edit_message_text(
+
+                f"🧪 @{username}\n✅ Постов: {len(fresh)}\n"
+
+                f"{'💬 коммент' if comment else '📝 пост'} | пропущено: {skipped}\n⏳ AI..."
+
+            )
+
+            await read_delay(tweet.text)
+
+            reply_text, prov = await generate_reply(
+
+                post_text=tweet.text,
+
+                comment_text=comment.text if comment else None,
+
+                provider=ai_provider,
+
+                system_prompt=system_prompt,
+
+            )
+
+            if reply_text != _SKIP:
+
+                break
+
+            skipped += 1
+
+
+
+        if reply_text == _SKIP:
+
+            await query.edit_message_text(
+
+                f"🤖 AI пропустил все {skipped} постов — не по теме.",
+
+                reply_markup=InlineKeyboardMarkup(
+
+                    [
+
+                        [
+
+                            InlineKeyboardButton(
+
+                                "🔄 Ещё раз", callback_data=f"test:{acc_id}"
+
+                            )
+
+                        ],
+
+                        [InlineKeyboardButton("🏠 Меню", callback_data="menu:main")],
+
+                    ]
+
+                ),
+
+            )
+
+            return
+
+
+
+        _target_id = comment.id if comment else tweet.id
+
+        log_id = await log_post(
+
+            account_id=acc_id,
+
+            post_id=tweet.id,
+
+            post_url=post_url,
+
+            post_text=tweet.text,
+
+            comment_id=_target_id,
+
+            comment_text=comment.text if comment else "",
+
+            reply_text=reply_text,
+
+            reply_variant2="",
+
+            ai_provider=prov,
+
+            sleep_seconds=0.0,
+
+        )
+
+
+
+        _target_lbl = (
+
+            f"💬 @{_md_escape(comment.author_username)}"
+
+            if comment
+
+            else f"📝 @{_md_escape(tweet.author_username)}"
+
+        )
+
+        base_text = (
+
+            f"🧪 *Тест* @{username} `[{prov}]`\n"
+
+            f"🎯 {_target_lbl} | ❤️{tweet.likes} | {_human_age(tweet.created_at)}\n\n"
+
+            f"{_md_escape(tweet.text[:280])}\n[Открыть пост]({post_url})\n\n"
+
+            f"🤖 *Ответ:*\n{_md_escape(reply_text)}\n\n"
+
+        )
+
+
+
+        if auto_publish:
+
+            await query.edit_message_text(
+
+                base_text + "⏳ Публикуем...",
+
+                parse_mode="Markdown",
+
+                disable_web_page_preview=True,
+
+            )
+
+            await compose_delay(reply_text)
+
+            new_id = await client.post_reply(reply_text, _target_id, tweet_url=post_url)
+
+            if new_id and tweet.id:
+
+                try:
+
+                    await client.like_tweet(tweet.id)
+
+                except Exception:
+
+                    pass
+
+            if new_id:
+
+                from config import rate_limiter
+
+                from db import increment_daily_count, update_account_last_used
+
+
+
+                await increment_daily_count(acc_id)
+
+                rate_limiter.record(acc_id)
+
+                await update_account_last_used(acc_id)
+
+                await query.edit_message_text(
+
+                    base_text
+
+                    + f"✅ [Опубликовано](https://x.com/{username}/status/{new_id})",
+
+                    parse_mode="Markdown",
+
+                    disable_web_page_preview=True,
+
+                    reply_markup=InlineKeyboardMarkup(
+
+                        [[InlineKeyboardButton("🏠 Меню", callback_data="menu:main")]]
+
+                    ),
+
+                )
+
+            else:
+
+                await update_log_status(log_id, "skipped")
+
+                await query.edit_message_text(
+
+                    base_text + "⚠️ Не удалось опубликовать.",
+
+                    parse_mode="Markdown",
+
+                    disable_web_page_preview=True,
+
+                    reply_markup=_back(),
+
+                )
+
+        else:
+
+            state.pending_queue.setdefault(acc_id, []).append(
+
+                {
+
+                    "log_id": log_id,
+
+                    "account_id": acc_id,
+
+                    "account_name": username,
+
+                    "tweet": tweet,
+
+                    "comment": comment,
+
+                    "target_id": _target_id,
+
+                    "reply_text": reply_text,
+
+                    "reply_variant2": "",
+
+                    "post_url": post_url,
+
+                    "provider": prov,
+
+                    "auth_token_enc": acc["auth_token"],
+
+                    "ct0_enc": acc["ct0"],
+
+                    "proxy_id": acc.get("proxy_id"),
+
+                    "image_urls": getattr(tweet, "image_urls", []) or [],
+
+                }
+
+            )
+
+            await query.edit_message_text(
+
+                base_text + "👆 Подтвердите:",
+
+                parse_mode="Markdown",
+
+                disable_web_page_preview=True,
+
+                reply_markup=InlineKeyboardMarkup(
+
+                    [
+
+                        [
+
+                            InlineKeyboardButton(
+
+                                "📤 Опубликовать", callback_data=f"post1:{log_id}"
+
+                            ),
+
+                            InlineKeyboardButton(
+
+                                "🔄 Regenerate", callback_data=f"regen:{log_id}"
+
+                            ),
+
+                        ],
+
+                        [
+
+                            InlineKeyboardButton(
+
+                                "❤️ Лайк", callback_data=f"likeonly:{log_id}"
+
+                            ),
+
+                            InlineKeyboardButton(
+
+                                "❌ Скип", callback_data=f"skip:{log_id}"
+
+                            ),
+
+                        ],
+
+                    ]
+
+                ),
+
+            )
+
+    except Exception as e:
+
+        logger.error(f"[Test] {e}")
+
+        await query.edit_message_text(f"❌ Ошибка теста: {e}", reply_markup=_back())
+
+    finally:
+
+        await client.close()
+
+
+
+
+
+# ─────────────────────────────────────────────
+
+# КОМАНДЫ
+
+# ─────────────────────────────────────────────
+
+
+
+
+
+async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+
+    if not await _is_admin(update):
+
+        await update.message.reply_text("⛔ Нет доступа.")
+
+        return
+
+    await _show_main_menu(update.message, edit=False)
+
+
+
+
+
+async def cmd_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+
+    if not await _is_admin(update):
+
+        return
+
+    await _show_main_menu(update.message, edit=False)
+
+
+
+
+
+async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+
+    if not await _is_admin(update):
+
+        return
+
+    accounts = await get_accounts(active_only=False)
+
+    lines = ["📊 *Статус*\n"]
+
+    for a in accounts:
+
+        running = (
+
+            state.worker_manager.is_running(a["id"]) if state.worker_manager else False
+
+        )
+
+        today = await get_daily_count(a["id"])
+
+        st = await get_all_settings(a["id"])
+
+        auto = st.get("auto_publish", False)
+
+        lines.append(
+
+            f"{'🟢' if running else '🔴'} @{a['username']} | {'авто 🚀' if auto else 'ручной ✋'} | {today}/день"
+
+        )
+
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+
+
+
+# ─────────────────────────────────────────────
+
+# ГЛАВНЫЙ CALLBACK
+
+# ─────────────────────────────────────────────
+
+
+
+
+
+async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+
+    query = update.callback_query
+
+    await query.answer()
+
+    if not await _is_admin(update):
+
+        await query.answer("⛔ Нет доступа", show_alert=True)
+
+        return
+
+
+
+    data = query.data
+
+    user = update.effective_user
+
+
+
+    _LONG = ("test:", "regen:", "post1:", "post2:", "likeonly:")
+
+    is_long = any(data.startswith(a) for a in _LONG)
+
+    if is_long and not _lock_user(user.id):
+
+        await query.answer("⏳ Подождите...", show_alert=True)
+
+        return
+
+
+
+    try:
+
+        if data.startswith("likeonly:"):
+
+            await _handle_like_only(int(data.split(":")[1]), query, ctx)
+
+            return
+
+
+
+        if data.startswith(("post1:", "post2:", "skip:", "regen:")):
+
+            action, lid_s = data.split(":", 1)
+
+            lid = int(lid_s)
+
+            if action in ("post1", "post2"):
+
+                await _handle_post(lid, action, query, ctx)
+
+            elif action == "skip":
+
+                await update_log_status(lid, "skipped")
+
+                item = _find_pending(lid)
+
+                acc_id_skip = item["account_id"] if item else None
+
+                if item:
+
+                    _remove_pending(item["account_id"], lid)
+
+                _pop_hitl_item(lid)
+
+                await query.edit_message_text(
+
+                    "❌ Пропущено.",
+
+                    reply_markup=InlineKeyboardMarkup(
+
+                        [
+
+                            (
+
+                                [
+
+                                    InlineKeyboardButton(
+
+                                        "🔄 Следующий",
+
+                                        callback_data=f"test:{acc_id_skip}",
+
+                                    )
+
+                                ]
+
+                                if acc_id_skip
+
+                                else []
+
+                            ),
+
+                            [
+
+                                InlineKeyboardButton(
+
+                                    "🏠 Меню", callback_data="menu:main"
+
+                                )
+
+                            ],
+
+                        ]
+
+                    ),
+
+                )
+
+            elif action == "regen":
+
+                await _handle_regen(lid, query, ctx)
+
+            return
+
+
+
+        if data == "menu:main":
+
+            await _show_main_menu(query)
+
+            return
+
+
+
+        if data.startswith("start:"):
+
+            acc_id = int(data.split(":")[1])
+
+            ok = (
+
+                await state.worker_manager.start(acc_id)
+
+                if state.worker_manager
+
+                else False
+
+            )
+
+            acc = await get_account(acc_id)
+
+            await query.edit_message_text(
+
+                f"▶️ @{acc['username']} запущен." if ok else "⚠️ Уже запущен.",
+
+                reply_markup=_back(),
+
+            )
+
+            return
+
+
+
+        if data.startswith("stop:"):
+
+            acc_id = int(data.split(":")[1])
+
+            ok = (
+
+                await state.worker_manager.stop(acc_id)
+
+                if state.worker_manager
+
+                else False
+
+            )
+
+            acc = await get_account(acc_id)
+
+            await query.edit_message_text(
+
+                f"⏹ @{acc['username']} остановлен." if ok else "⚠️ Не запущен.",
+
+                reply_markup=_back(),
+
+            )
+
+            return
+
+
+
+        if data.startswith("test:"):
+
+            await _handle_test(int(data.split(":")[1]), query)
+
+            return
+
+
+
+        if data.startswith("settings:"):
+
+            await _show_settings(int(data.split(":")[1]), query)
+
+            return
+
+
+
+        if data.startswith("set_auto:"):
+
+            _, acc_id_s, val_s = data.split(":")
+
+            await set_setting(int(acc_id_s), "auto_publish", val_s == "1")
+
+            await _show_settings(int(acc_id_s), query)
+
+            return
+
+
+
+        if data.startswith("set_mode:"):
+
+            parts = data.split(":")
+
+            await set_setting(int(parts[1]), "search_mode", parts[2])
+
+            await _show_settings(int(parts[1]), query)
+
+            return
+
+
+
+        if data.startswith("set_ai:"):
+
+            parts = data.split(":")
+
+            await set_setting(int(parts[1]), "ai_provider", parts[2])
+
+            await _show_settings(int(parts[1]), query)
+
+            return
+
+
+
+        if data.startswith("set_sort:"):
+
+            _, acc_id_s, val = data.split(":")
+
+            await set_setting(int(acc_id_s), "comment_sort", val)
+
+            await _show_settings(int(acc_id_s), query)
+
+            return
+
+
+
+        if data.startswith("set_rmode:"):
+
+            _, acc_id_s, val = data.split(":")
+
+            await set_setting(int(acc_id_s), "reply_mode", val)
+
+            await _show_settings(int(acc_id_s), query)
+
+            return
+
+
+
+        if data == "acc:del_list":
+
+            await _show_delete_list(query)
+
+            return
+
+
+
+        if data.startswith("acc:del:") and not data.startswith("acc:del_ok:"):
+
+            await _acc_delete_confirm(int(data.split(":")[2]), query)
+
+            return
+
+
+
+        if data.startswith("acc:del_ok:"):
+
+            await _acc_delete_ok(int(data.split(":")[2]), query)
+
+            return
+
+
+
+        if data.startswith("acc:keywords:"):
+
+            await _show_keywords(int(data.split(":")[2]), query)
+
+            return
+
+
+
+        logger.warning("[TG] Unknown callback: {}", data)
+
+
+
+    finally:
+
+        if is_long:
+
+            _unlock_user(user.id)
+
+
+
+
+
+# ─────────────────────────────────────────────
+
+# УВЕДОМЛЕНИЯ / ЗАПРОС ОДОБРЕНИЯ
+
+# ─────────────────────────────────────────────
+
+
+
+
+
+async def send_posted_notification(
+
+    app: Application,
+
+    account_name: str,
+
+    tweet,
+
+    comment,
+
+    reply_text: str,
+
+    post_url: str,
+
+    new_tweet_id: str,
+
+    provider: str,
+
+) -> None:
+
+    settings = get_settings()
+
+    if not settings.telegram_admin_ids:
+
+        return
+
+    new_url = f"https://x.com/i/status/{new_tweet_id}"
+
+    mode_icon = "💬" if comment else "📝"
+
+    target = (
+
+        f"КОММЕНТ @{_md_escape(comment.author_username)}"
+
+        if comment
+
+        else f"ПОСТ @{_md_escape(tweet.author_username)}"
+
+    )
+
+    text = (
+
+        f"✅ *@{_md_escape(account_name)}* `[{provider}]`\n"
+
+        f"{mode_icon} *{target}*\n\n"
+
+        f"🐦 @{_md_escape(tweet.author_username)} ❤️{tweet.likes}\n"
+
+        f"{_md_escape(tweet.text[:200])}\n"
+
+        f"[Пост]({post_url}) | [Ответ]({new_url})\n\n"
+
+        f"🤖 {_md_escape(reply_text)}"
+
+    )
+
+    for admin_id in settings.telegram_admin_ids:
+
+        try:
+
+            await app.bot.send_message(
+
+                chat_id=admin_id,
+
+                text=text,
+
+                parse_mode="Markdown",
+
+                disable_web_page_preview=True,
+
+            )
+
+        except Exception as e:
+
+            logger.error(f"[TG] notify {admin_id}: {e}")
+
+
+
+
+
+async def send_approval_request(item: dict, app: Application) -> None:
+
+    settings = get_settings()
+
+    if not settings.telegram_admin_ids:
+
+        return
+
+
+
+    tweet = item["tweet"]
+
+    comment = item.get("comment")
+
+    reply = item["reply_text"]
+
+    log_id = item["log_id"]
+
+    post_url = item.get("post_url", "")
+
+    prov = item.get("provider", "?")
+
+    acc_name = item.get("account_name", "?")
+
+    image_urls = item.get("image_urls", [])
+
+
+
+    _register_hitl_item(log_id, item)
+
+
+
+    mode_icon = "💬" if comment else "📝"
+
+    target = (
+
+        f"КОММЕНТ @{_md_escape(comment.author_username)}"
+
+        if comment
+
+        else f"ПОСТ @{_md_escape(tweet.author_username)}"
+
+    )
+
+    target_block = (
+
+        f"💬 @{_md_escape(comment.author_username)}: {_md_escape(comment.text[:200])}\n\n"
+
+        if comment
+
+        else ""
+
+    )
+
+    text = (
+
+        f"✏️ *@{acc_name}* `[{prov}]`\n"
+
+        f"{mode_icon} *{target}*\n\n"
+
+        f"🐦 @{_md_escape(tweet.author_username)} ❤️{tweet.likes} | {_human_age(tweet.created_at)}\n"
+
+        f"{_md_escape(tweet.text[:280])}\n"
+
+        f"[Открыть пост]({post_url})\n\n"
+
+        f"{target_block}"
+
+        f"🤖 *Ответ:*\n{_md_escape(reply)}"
+
+    )
+
+    markup = InlineKeyboardMarkup(
+
+        [
+
+            [
+
+                InlineKeyboardButton(
+
+                    "📤 Опубликовать", callback_data=f"post1:{log_id}"
+
+                ),
+
+                InlineKeyboardButton("🔄 Regenerate", callback_data=f"regen:{log_id}"),
+
+            ],
+
+            [
+
+                InlineKeyboardButton("❤️ Лайк", callback_data=f"likeonly:{log_id}"),
+
+                InlineKeyboardButton("❌ Скип", callback_data=f"skip:{log_id}"),
+
+            ],
+
+        ]
+
+    )
+
+    for admin_id in settings.telegram_admin_ids:
+
+        try:
+
+            if image_urls:
+
+                try:
+
+                    await app.bot.send_photo(
+
+                        chat_id=admin_id,
+
+                        photo=image_urls[0],
+
+                        caption=f"🖼 @{tweet.author_username}",
+
+                    )
+
+                except Exception:
+
+                    pass
+
+            await app.bot.send_message(
+
+                chat_id=admin_id,
+
+                text=text,
+
+                parse_mode="Markdown",
+
+                reply_markup=markup,
+
+                disable_web_page_preview=True,
+
+            )
+
+        except Exception as e:
+
+            logger.error(f"[TG] approval {admin_id}: {e}")
+
+
+
+
+
+# ─────────────────────────────────────────────
+
+# APP BUILDER
+
+# ─────────────────────────────────────────────
+
+
+
+
+
+def build_application() -> Application:
+
+    return Application.builder().token(get_settings().telegram_bot_token).build()
+
+
+
+
+
+def register_handlers(app: Application) -> None:
+
+    add_account_conv = ConversationHandler(
+
+        entry_points=[CallbackQueryHandler(_acc_add_start, pattern="^acc:add$")],
+
+        states={
+
+            ST_ADD_TOKEN: [
+
+                MessageHandler(filters.TEXT & ~filters.COMMAND, _acc_add_token)
+
+            ],
+
+            ST_ADD_CT0: [MessageHandler(filters.TEXT & ~filters.COMMAND, _acc_add_ct0)],
+
+            ST_ADD_PROXY: [
+
+                MessageHandler(filters.TEXT & ~filters.COMMAND, _acc_add_proxy_text),
+
+                CallbackQueryHandler(_acc_add_noproxy, pattern="^acc:add_noproxy$"),
+
+                CallbackQueryHandler(_acc_add_cancel, pattern="^acc:add_cancel$"),
+
+            ],
+
+        },
+
+        fallbacks=[CallbackQueryHandler(_acc_add_cancel, pattern="^acc:add_cancel$")],
+
+        allow_reentry=True,
+
+        per_message=False,
+
+    )
+
+    keywords_conv = ConversationHandler(
+
+        entry_points=[CallbackQueryHandler(_kw_edit_start, pattern="^kw:edit:")],
+
+        states={
+
+            ST_SET_KEYWORDS: [MessageHandler(filters.TEXT & ~filters.COMMAND, _kw_save)]
+
+        },
+
+        fallbacks=[CallbackQueryHandler(on_callback)],
+
+        allow_reentry=True,
+
+        per_message=False,
+
+    )
+
+    app.add_handler(add_account_conv)
+
+    app.add_handler(keywords_conv)
+
+    app.add_handler(CommandHandler("start", cmd_start))
+
+    app.add_handler(CommandHandler("menu", cmd_menu))
+
+    app.add_handler(CommandHandler("status", cmd_status))
+
+    app.add_handler(CallbackQueryHandler(on_callback))
+
+
                 await state.worker_manager.start(acc_id)
 
                 if state.worker_manager
