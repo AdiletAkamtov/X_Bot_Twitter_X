@@ -320,3 +320,325 @@ class BotWorker:
                 # но ещё не ответили на комментарий — это и есть пара "Пост+Комент"
                 candidate_tweets = []
                 for tweet in tweets:
+                    already_post = await was_already_replied(
+                        self.account_id, tweet.id, tweet.id
+                    )
+                    if already_post:
+                        candidate_tweets.insert(
+                            0, tweet
+                        )  # приоритет: уже ответили на пост
+                    else:
+                        candidate_tweets.append(tweet)
+
+                for tweet in candidate_tweets:
+                    if self._stop_event.is_set():
+                        break
+                    await asyncio.sleep(random.uniform(1.5, 3.5))
+                    comment = await client.get_top_comment(
+                        tweet, sort_by=sort_by, own_username=username
+                    )
+                    if not comment:
+                        logger.debug(
+                            f"[Worker:{self.account_id}] {tweet.id}: нет комментариев — пропуск"
+                        )
+                        continue
+                    if await was_already_replied(self.account_id, tweet.id, comment.id):
+                        logger.debug(
+                            f"[Worker:{self.account_id}] {tweet.id}: коммент {comment.id} уже обработан"
+                        )
+                        continue
+                    chosen_tweet = tweet
+                    chosen_comment = comment
+                    logger.info(
+                        f"[Worker:{self.account_id}] 💬 Режим B: @{tweet.author_username} "
+                        f"→ коммент @{comment.author_username}: {comment.text[:80]}"
+                    )
+                    break
+
+            if not chosen_tweet:
+                logger.info(
+                    f"[Worker:{self.account_id}] Нет подходящих постов в этой выборке"
+                )
+                return
+
+            post_url = (
+                f"https://x.com/{chosen_tweet.author_username}/status/{chosen_tweet.id}"
+            )
+
+            # ── Если режим B не нашёл ни одного комментария — фолбэк на пост ──
+            if mode_reply == "comment" and not chosen_comment:
+                logger.info(
+                    f"[Worker:{self.account_id}] 💬→📝 Нет комментариев ни у одного поста → фолбэк на ответ на пост"
+                )
+                # Найти пост на который не отвечали вообще (ни на сам пост, ни на комментарии)
+                for tweet in tweets:
+                    if not await was_replied_any(self.account_id, tweet.id):
+                        chosen_tweet = tweet
+                        chosen_comment = None
+                        post_url = f"https://x.com/{chosen_tweet.author_username}/status/{chosen_tweet.id}"
+                        break
+
+            if not chosen_tweet:
+                logger.info(
+                    f"[Worker:{self.account_id}] Нет подходящих постов после фолбэка"
+                )
+                return
+
+            # ── Определяем target ДО генерации AI ────────────────────────────
+            target_id = chosen_comment.id if chosen_comment else chosen_tweet.id
+            log_comment_id = target_id
+            log_comment_text = (
+                chosen_comment.text if chosen_comment else chosen_tweet.text
+            )
+
+            reply_target = (
+                f"💬 на комментарий @{chosen_comment.author_username}"
+                if chosen_comment
+                else f"📝 на пост @{chosen_tweet.author_username}"
+            )
+            logger.info(f"[Worker:{self.account_id}] 🎯 Цель: {reply_target}")
+
+            # ── AI генерирует ЗНАЯ точную цель ───────────────────────────────
+            logger.info(
+                f"[Worker:{self.account_id}] 🤖 AI ({ai_provider}) | {reply_target}..."
+            )
+            await read_delay(chosen_tweet.text)
+            try:
+                reply_text, provider_used = await generate_reply(
+                    post_text=chosen_tweet.text,
+                    comment_text=chosen_comment.text if chosen_comment else None,
+                    provider=ai_provider,
+                    system_prompt=system_prompt,
+                )
+
+                # ── Пост не по теме — AI вернул SKIP → пропускаем без лога ──
+                from ai import REPLY_SKIP as _REPLY_SKIP
+
+                if reply_text == _REPLY_SKIP:
+                    logger.info(
+                        f"[Worker:{self.account_id}] 🚫 AI SKIP — пост @{chosen_tweet.author_username} не по теме"
+                    )
+                    return
+
+                # ── Убираем @mention в начале если AI добавил сам ────────────
+                # X автоматически добавляет @mention при reply — двойной mention выглядит плохо
+                import re as _re
+
+                reply_text = _re.sub(r"^@\w+\s*", "", reply_text).strip()
+
+                logger.info(
+                    f"[Worker:{self.account_id}] 💬 Reply ({reply_target}): {reply_text[:100]}..."
+                )
+            except Exception as e:
+                logger.error(f"[Worker:{self.account_id}] AI failed: {e}")
+                return
+
+            log_id = await log_post(
+                account_id=self.account_id,
+                post_id=chosen_tweet.id,
+                post_url=post_url,
+                post_text=chosen_tweet.text,
+                comment_id=log_comment_id,
+                comment_text=log_comment_text,
+                reply_text=reply_text,
+                reply_variant2="",
+                ai_provider=provider_used,
+            )
+
+            # ── Публикуем или отправляем в Telegram ──────────────────────────
+            if auto_publish:
+                await compose_delay(reply_text)
+                new_id = await client.post_reply(
+                    reply_text, target_id, tweet_url=post_url
+                )
+                if new_id:
+                    await update_log_status(log_id, "posted")
+                    await increment_daily_count(self.account_id)
+                    rate_limiter.record(self.account_id)
+                    await update_account_last_used(self.account_id)
+                    if chosen_comment:
+                        logger.success(
+                            f"[Worker:{self.account_id}] ✅ ОТВЕТ НА КОММЕНТАРИЙ "
+                            f"@{chosen_comment.author_username} "
+                            f"(пост @{chosen_tweet.author_username}) "
+                            f"→ {post_url} | new_id={new_id}"
+                        )
+                    else:
+                        logger.success(
+                            f"[Worker:{self.account_id}] ✅ ОТВЕТ НА ПОСТ "
+                            f"@{chosen_tweet.author_username} "
+                            f"→ {post_url} | new_id={new_id}"
+                        )
+                    # ── Отправляем уведомление в Telegram ──
+                    if state.tg_app:
+                        try:
+                            await send_posted_notification(
+                                app=state.tg_app,
+                                account_name=username,
+                                tweet=chosen_tweet,
+                                comment=chosen_comment,
+                                reply_text=reply_text,
+                                post_url=post_url,
+                                new_tweet_id=new_id,
+                                provider=provider_used,
+                            )
+                        except Exception as _tg_err:
+                            logger.warning(
+                                f"[Worker:{self.account_id}] TG notify failed: {_tg_err}"
+                            )
+                elif not new_id:
+                    await update_log_status(log_id, "skipped")
+                    logger.info(
+                        f"[Worker:{self.account_id}] ⚠️ Не удалось опубликовать (цель недоступна)"
+                    )
+            else:
+                item = {
+                    "log_id": log_id,
+                    "account_id": self.account_id,
+                    "account_name": username,
+                    "tweet": chosen_tweet,
+                    "comment": chosen_comment,
+                    "target_id": target_id,
+                    "is_second_visit": chosen_comment is not None,
+                    "reply_text": reply_text,
+                    "reply_variant2": "",
+                    "post_url": post_url,
+                    "provider": provider_used,
+                    "image_urls": chosen_tweet.image_urls or [],
+                    # Store credentials instead of live client — client is closed
+                    # when _cycle() returns (async with block exits). _handle_post
+                    # will create a fresh client when the user presses POST.
+                    "auth_token_enc": account["auth_token"],
+                    "ct0_enc": account["ct0"],
+                    "proxy_id": account.get("proxy_id"),
+                }
+                _pending_queue.setdefault(self.account_id, []).append(item)
+                await _notify_pending(item)
+                logger.info(
+                    f"[Worker:{self.account_id}] ⏳ Telegram approval "
+                    f"({'режим B: коммент' if chosen_comment else 'режим A: пост'})"
+                )
+
+    async def _fetch_tweets(self, client: TwitterClient, settings: dict):
+        mode = settings.get("search_mode", BotDefaults.search_mode)
+        min_likes = _int(settings.get("min_likes"), BotDefaults.min_likes)
+        min_rt = _int(settings.get("min_retweets"), BotDefaults.min_retweets)
+        max_age = _int(settings.get("max_age_min"), BotDefaults.max_post_age_minutes)
+        lang = settings.get("lang_filter", "en")  # default: English only
+
+        logger.debug(
+            f"[Worker:{self.account_id}] _fetch_tweets | mode={mode} min_likes={min_likes} min_rt={min_rt} max_age={max_age}min lang={lang}"
+        )
+
+        if mode == "keywords":
+            keywords = await get_keywords(self.account_id)
+            logger.debug(f"[Worker:{self.account_id}] Keywords: {keywords}")
+            if not keywords:
+                logger.warning(
+                    f"[Worker:{self.account_id}] No keywords configured — add keywords in Settings."
+                )
+                return []
+
+            # Пробуем все ключевые слова по очереди, пока не наберём 30+ новых твитов
+            all_tweets: list = []
+            shuffled_kws = list(keywords)
+            random.shuffle(shuffled_kws)
+            for kw in shuffled_kws[:5]:  # max 5 keywords per cycle
+                logger.info(f"[Worker:{self.account_id}] Searching keyword: '{kw}'")
+                found = await client.search_tweets(
+                    query=kw,
+                    min_likes=min_likes,
+                    min_retweets=min_rt,
+                    max_age_minutes=max_age,
+                    lang=lang,
+                    limit=50,
+                )
+                logger.info(
+                    f"[Worker:{self.account_id}] Search '{kw}' → {len(found)} tweets"
+                )
+                # Add only tweets not already in list
+                existing_ids = {t.id for t in all_tweets}
+                all_tweets.extend(t for t in found if t.id not in existing_ids)
+                if len(all_tweets) >= 30:
+                    break
+            tweets = all_tweets
+            logger.info(
+                f"[Worker:{self.account_id}] Total unique tweets: {len(tweets)}"
+            )
+
+            if not tweets:
+                logger.warning(
+                    f"[Worker:{self.account_id}] Keywords search returned 0 tweets. "
+                    f"Query: '{shuffled_kws[0] if shuffled_kws else '?'}' | min_likes={min_likes} min_rt={min_rt} max_age={max_age}min lang={lang}. "
+                    f"Check: 1) lower min_likes in Settings, 2) account may lack search access."
+                )
+                return []
+            return tweets
+
+        elif mode == "list":
+            lists = await get_x_lists(self.account_id)
+            logger.debug(f"[Worker:{self.account_id}] X Lists: {lists}")
+            if not lists:
+                logger.warning(f"[Worker:{self.account_id}] No X Lists configured")
+                return []
+            url = random.choice(lists)
+            logger.info(f"[Worker:{self.account_id}] Fetching list: {url}")
+            tweets = await client.get_list_tweets(
+                list_url=url,
+                min_likes=min_likes,
+                min_retweets=min_rt,
+                max_age_minutes=max_age,
+                lang=lang,
+            )
+            logger.info(
+                f"[Worker:{self.account_id}] List lang:{lang} → {len(tweets)} tweets after filters"
+            )
+            return tweets
+
+        elif mode == "recommendations":
+            logger.info(
+                f"[Worker:{self.account_id}] Fetching recommendations (min_likes={min_likes}, lang={lang})"
+            )
+            tweets = await client.get_recommended_tweets(min_likes=min_likes, lang=lang)
+            logger.info(
+                f"[Worker:{self.account_id}] Recommendations → {len(tweets)} tweets"
+            )
+            return tweets
+
+        logger.error(f"[Worker:{self.account_id}] Unknown search_mode: '{mode}'")
+        return []
+
+
+# ─────────────────────────────────────────────
+# WORKER MANAGER
+# ─────────────────────────────────────────────
+
+
+class WorkerManager:
+    def __init__(self):
+        self._workers: dict[int, tuple[BotWorker, asyncio.Task]] = {}
+
+    async def start(self, account_id: int) -> bool:
+        if account_id in self._workers:
+            logger.info(f"Worker {account_id} already running")
+            return False
+        worker = BotWorker(account_id)
+        task = asyncio.create_task(worker.run(), name=f"worker-{account_id}")
+        self._workers[account_id] = (worker, task)
+        logger.info(f"Started worker for account {account_id}")
+        return True
+
+    async def stop(self, account_id: int) -> bool:
+        if account_id not in self._workers:
+            return False
+        worker, task = self._workers.pop(account_id)
+        worker.stop()
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        logger.info(f"Stopped worker for account {account_id}")
+        return True
+
+    def is_running(self, account_id: int) -> bool:
