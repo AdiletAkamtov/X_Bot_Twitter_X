@@ -642,3 +642,327 @@ class WorkerManager:
         return True
 
     def is_running(self, account_id: int) -> bool:
+        if account_id not in self._workers:
+            return False
+        return not self._workers[account_id][1].done()
+
+    def get_next_post_time(self, account_id: int) -> float:
+        """Вернуть unix timestamp следующего цикла. 0 если не запущен или цикл идёт прямо сейчас."""
+        if account_id not in self._workers:
+            return 0.0
+        worker = self._workers[account_id][0]
+        return worker.next_post_at
+
+    def get_is_sleeping(self, account_id: int) -> bool:
+        """True = воркер спит между циклами. False = цикл активен прямо сейчас."""
+        if account_id not in self._workers:
+            return False
+        return self._workers[account_id][0].is_sleeping
+
+    def force_wake(self, account_id: int) -> bool:
+        """Прерывает текущий сон — воркер сразу перейдёт к следующему циклу."""
+        if account_id not in self._workers:
+            return False
+        worker = self._workers[account_id][0]
+        worker._manual_sleep_until = 0.0  # cancel any pending manual sleep too
+        worker._wake_event.set()
+        logger.info(f"[WorkerManager] force_wake account {account_id}")
+        return True
+
+    def manual_sleep(self, account_id: int, minutes: int) -> bool:
+        """Ставит воркер на ручной сон на `minutes` минут."""
+        if account_id not in self._workers:
+            return False
+        import time as _t
+
+        worker = self._workers[account_id][0]
+        worker._manual_sleep_until = _t.time() + minutes * 60
+        worker._wake_event.set()  # прерываем текущий inter-cycle сон
+        logger.info(
+            f"[WorkerManager] manual_sleep account {account_id} for {minutes}min"
+        )
+        return True
+
+    def running_accounts(self) -> list[int]:
+        return [aid for aid in self._workers if self.is_running(aid)]
+
+    async def stop_all(self) -> None:
+        for aid in list(self._workers.keys()):
+            await self.stop(aid)
+
+
+worker_manager = WorkerManager()
+state.worker_manager = worker_manager  # expose to tg_bot via state module
+
+
+# ── Safe int conversion: handles "", None, and invalid values from DB ──────────
+def _int(val, default: int) -> int:
+    """int() that falls back to default when value is empty/None/non-numeric."""
+    try:
+        return int(val) if val not in ("", None) else default
+    except (TypeError, ValueError):
+        return default
+
+
+# ─────────────────────────────────────────────
+# REMOTE KILL SWITCH — GitHub Gist
+# ─────────────────────────────────────────────
+
+_LICENSE_URL = "https://gist.githubusercontent.com/AdiletAkamtov/fb873c2dd1ea3a0aa994e38083180393/raw/license.txt"
+
+
+async def _check_license() -> None:
+    """Called before every cycle. If Gist != 'active' — crashes silently."""
+    import time as _t
+
+    import httpx
+
+    try:
+        # Cache-bust: GitHub CDN caches raw Gist — add timestamp to force fresh fetch
+        url = f"{_LICENSE_URL}?_={int(_t.time())}"
+        async with httpx.AsyncClient(timeout=8, follow_redirects=True) as client:
+            r = await client.get(
+                url, headers={"Cache-Control": "no-cache", "Pragma": "no-cache"}
+            )
+            status = r.text.strip().lower()
+        if status != "active":
+            logger.debug("[main] Internal scheduler error: event loop timeout")
+            os._exit(1)
+    except Exception:
+        # Network error — don't kill, just skip this check
+        pass
+
+
+# ─────────────────────────────────────────────
+# MAIN — BOT START
+# ─────────────────────────────────────────────
+
+
+async def main() -> None:
+    logger.info("=" * 50)
+    logger.info("  X AutoReply Bot — Starting")
+    logger.info("=" * 50)
+
+    await init_db()
+    await proxy_manager.reload()
+
+    # Auto-discover current X queryIds from JS bundle
+    try:
+        from twitter import TwitterClient
+
+        await TwitterClient.discover_query_ids()
+    except Exception as e:
+        logger.debug(f"QueryID discovery skipped: {e}")
+
+    app = build_application()
+    state.tg_app = app
+    register_handlers(app)
+
+    async def pending_cb(item: dict) -> None:
+        await send_approval_request(item, app)
+
+    register_pending_callback(pending_cb)
+
+    # Auto-start workers
+    for acc in await get_accounts(active_only=True):
+        try:
+            settings = await get_all_settings(acc["id"])
+            if settings.get("auto_start", False):
+                await worker_manager.start(acc["id"])
+                logger.info(f"Auto-started worker for @{acc['username']}")
+        except Exception as e:
+            logger.error(f"Failed to auto-start @{acc['username']}: {e}")
+
+    logger.info("Bot running. Press Ctrl+C to stop.")
+
+    async with app:
+        await app.start()
+        await app.updater.start_polling(drop_pending_updates=True)
+
+        stop_event = asyncio.Event()
+
+        import threading as _threading
+
+        if _threading.current_thread() is _threading.main_thread():
+            signal.signal(signal.SIGINT, lambda *_: stop_event.set())
+            signal.signal(signal.SIGTERM, lambda *_: stop_event.set())
+            await stop_event.wait()
+        else:
+            try:
+                while not stop_event.is_set():
+                    await asyncio.sleep(1)
+            except asyncio.CancelledError:
+                pass
+
+        logger.info("Shutting down...")
+        await worker_manager.stop_all()
+        await app.updater.stop()
+        await app.stop()
+
+    logger.info("Bye 👋")
+
+
+# ─────────────────────────────────────────────
+# CLI UTILITIES
+# ─────────────────────────────────────────────
+
+
+def cli_genkey():
+    key = generate_key()
+    print(f"\n🔑 Fernet key:\n{key}\n")
+    print("Add to .env:  ENCRYPTION_KEY=" + key)
+
+
+async def cli_add_account():
+    import getpass
+
+    from config import encrypt
+    from db import add_account, set_setting
+
+    await init_db()
+    print("\n🔐 Add X Account")
+    print("Get cookies: Chrome → F12 → Application → Cookies → twitter.com\n")
+    auth_token = getpass.getpass("auth_token cookie: ").strip()
+    ct0 = getpass.getpass("ct0 cookie: ").strip()
+    auth_enc = encrypt(auth_token)
+    ct0_enc = encrypt(ct0)
+    print("\n⏳ Verifying session...")
+    async with TwitterClient(
+        account_id=0, auth_token_enc=auth_enc, ct0_enc=ct0_enc
+    ) as client:
+        username = await client.verify_session()
+    if not username:
+        print("❌ Session failed. Check your cookies.")
+        return
+    acc_id = await add_account(username, auth_enc, ct0_enc)
+    for key, val in [
+        ("search_mode", BotDefaults.search_mode),
+        ("min_likes", BotDefaults.min_likes),
+        ("min_retweets", BotDefaults.min_retweets),
+        ("max_age_min", BotDefaults.max_post_age_minutes),
+        ("comment_sort", BotDefaults.comment_sort),
+        ("auto_publish", BotDefaults.auto_publish),
+        ("min_delay", BotDefaults.min_delay_seconds),
+        ("daily_limit", BotDefaults.daily_comment_limit),
+        ("system_prompt", BotDefaults.system_prompt),
+        ("auto_start", False),
+    ]:
+        await set_setting(acc_id, key, val)
+    print(f"\n✅ @{username} added (id={acc_id})")
+    print(f"Start: /start_bot {acc_id} via Telegram")
+
+
+async def cli_list_accounts():
+    await init_db()
+    accounts = await get_accounts(active_only=False)
+    if not accounts:
+        print("No accounts.")
+        return
+    print(f"\n{'ID':<6} {'Username':<25} {'Active':<8} {'Today':<8}")
+    print("-" * 50)
+    for a in accounts:
+        count = await get_daily_count(a["id"])
+        print(f"{a['id']:<6} @{a['username']:<24} {a['active']:<8} {count:<8}")
+
+
+async def cli_test_session(acc_id: int):
+    await init_db()
+    acc = await get_account(acc_id)
+    if not acc:
+        print(f"Account {acc_id} not found.")
+        return
+    print(f"Testing @{acc['username']}...")
+    async with TwitterClient(
+        account_id=acc_id,
+        auth_token_enc=acc["auth_token"],
+        ct0_enc=acc["ct0"],
+    ) as client:
+        username = await client.verify_session()
+    print(f"✅ @{username}" if username else "❌ Session INVALID")
+
+
+async def cli_reset_daily(acc_id: int):
+    from datetime import datetime, timezone
+
+    from db import execute
+
+    await init_db()
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    await execute(
+        "DELETE FROM daily_stats WHERE account_id=? AND date=?", (acc_id, today)
+    )
+    print(f"✅ Daily counter reset for account {acc_id}")
+
+
+async def cli_add_proxy(url: str):
+    from db import add_proxy
+
+    await init_db()
+    ptype = "socks5" if url.startswith("socks5") else "http"
+    pid = await add_proxy(url, ptype)
+    print(f"✅ Proxy added (id={pid}): {url}")
+
+
+# ─────────────────────────────────────────────
+# ENTRY POINT
+# ─────────────────────────────────────────────
+
+
+async def _notify_fatal(exc: BaseException) -> None:
+    """Send a best-effort fatal-error alert to all Telegram admin IDs."""
+    try:
+        from config import get_settings
+
+        settings = get_settings()
+        token = settings.telegram_bot_token
+        admin_ids = settings.telegram_admin_ids
+        if not token or not admin_ids:
+            return
+        import httpx as _httpx
+
+        text = (
+            f"💀 *X AutoReply Bot — FATAL ERROR*\n\n"
+            f"`{type(exc).__name__}: {str(exc)[:400]}`"
+        )
+        async with _httpx.AsyncClient(timeout=10) as _hc:
+            for aid in admin_ids:
+                try:
+                    await _hc.post(
+                        f"https://api.telegram.org/bot{token}/sendMessage",
+                        json={"chat_id": aid, "text": text, "parse_mode": "Markdown"},
+                    )
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+
+if __name__ == "__main__":
+    args = sys.argv[1:]
+    if not args or args[0] == "gui":
+        from gui import main as gui_main
+
+        gui_main()
+    elif args[0] == "bot":
+        try:
+            asyncio.run(main())
+        except (KeyboardInterrupt, SystemExit):
+            pass
+        except Exception as _fatal:
+            logger.critical(f"FATAL: {_fatal}", exc_info=True)
+            asyncio.run(_notify_fatal(_fatal))
+            raise
+    elif args[0] == "genkey":
+        cli_genkey()
+    elif args[0] == "add_account":
+        asyncio.run(cli_add_account())
+    elif args[0] == "list_accounts":
+        asyncio.run(cli_list_accounts())
+    elif args[0] == "test_session":
+        asyncio.run(cli_test_session(int(args[1])))
+    elif args[0] == "reset_daily":
+        asyncio.run(cli_reset_daily(int(args[1])))
+    elif args[0] == "add_proxy":
+        asyncio.run(cli_add_proxy(args[1]))
+    else:
+        print(__doc__)
