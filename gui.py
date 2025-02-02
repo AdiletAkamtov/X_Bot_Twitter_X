@@ -1252,3 +1252,631 @@ class XBotApp(tk.Tk):
         tk.Label(card, text="Keys are saved to %APPDATA%/XBot/.env  (created automatically on first launch)",
                  font=("Segoe UI", 8), fg=C["muted"],
                  bg=C["surface"]).grid(row=14, column=0, columnspan=2,
+                                       sticky="w", padx=16, pady=(0,16))
+
+        # Load on build
+        self.after(500, self._load_apikeys)
+    def _load_apikeys(self):
+        from config import _ENV_FILE
+        env_path = _ENV_FILE
+        if not env_path.exists(): return
+        vals = {}
+        for line in env_path.read_text(encoding="utf-8").splitlines():
+            if "=" in line and not line.startswith("#"):
+                k, _, v = line.partition("=")
+                vals[k.strip()] = v.strip()
+        self._e_openai.delete(0, "end")
+        self._e_openai.insert(0, vals.get("OPENAI_API_KEY", ""))
+        self._e_gemini.delete(0, "end")
+        self._e_gemini.insert(0, vals.get("GEMINI_API_KEY", ""))
+        self._e_perplexity.delete(0, "end")
+        self._e_perplexity.insert(0, vals.get("PERPLEXITY_API_KEY", ""))
+        self._e_groq.delete(0, "end")
+        self._e_groq.insert(0, vals.get("GROQ_API_KEY", ""))
+        self._e_tg_token.delete(0, "end")
+        self._e_tg_token.insert(0, vals.get("TELEGRAM_BOT_TOKEN", ""))
+        self._e_tg_admins.delete(0, "end")
+        self._e_tg_admins.insert(0, vals.get("TELEGRAM_ADMIN_IDS", ""))
+        self._e_provider.set(vals.get("DEFAULT_AI_PROVIDER", "groq"))
+    def _save_apikeys(self):
+        from config import _ENV_FILE, save_env_value, reload_settings
+        from ai import reset_ai_clients
+        # Normalize admin IDs: strip brackets/spaces
+        admin_raw = self._e_tg_admins.get().strip()
+        admin_clean = ",".join(
+            x.strip() for x in admin_raw.replace("[","").replace("]","").split(",")
+            if x.strip().lstrip("-").isdigit()
+        )
+        save_env_value("OPENAI_API_KEY",      self._e_openai.get().strip())
+        save_env_value("GEMINI_API_KEY",       self._e_gemini.get().strip())
+        save_env_value("PERPLEXITY_API_KEY",   self._e_perplexity.get().strip())
+        save_env_value("GROQ_API_KEY",         self._e_groq.get().strip())
+        save_env_value("TELEGRAM_BOT_TOKEN",   self._e_tg_token.get().strip())
+        save_env_value("TELEGRAM_ADMIN_IDS",   admin_clean)
+        save_env_value("DEFAULT_AI_PROVIDER",  self._e_provider.get())
+        try:
+            reload_settings()
+            reset_ai_clients()
+            _logger.success(f"[GUI] API keys saved (provider={self._e_provider.get()})")
+            messagebox.showinfo("Saved",
+                                "Keys saved and applied!\n\nAI providers reloaded.",
+                                parent=self)
+        except Exception as e:
+            _logger.warning(f"[GUI] Keys saved, reload failed: {e}")
+            messagebox.showinfo("Saved",
+                                f"Keys saved.\n\nRestart to apply. ({e})",
+                                parent=self)
+    # ── Playwright check/fix ───────────────────────────────────────────────────
+
+    def _check_playwright(self):
+        """Проверить версию Playwright и при необходимости переустановить."""
+        from browser_poster import REQUIRED_PLAYWRIGHT_VERSION
+
+        # Окно с логом прогресса
+        win = tk.Toplevel(self)
+        win.title("🔧 Проверка Playwright")
+        win.geometry("600x380")
+        win.configure(bg=C["bg"])
+        win.resizable(False, False)
+
+        tk.Label(win, text="Проверка и установка Playwright",
+                 font=("Segoe UI", 11, "bold"),
+                 fg=C["text"], bg=C["bg"]).pack(pady=(16, 4))
+        tk.Label(win,
+                 text=f"Требуется версия: playwright=={REQUIRED_PLAYWRIGHT_VERSION}",
+                 font=("Segoe UI", 9), fg=C["muted"], bg=C["bg"]).pack()
+
+        txt = tk.Text(win, font=("Consolas", 9), bg="#1e1e2e", fg="#cdd6f4",
+                      relief="flat", state="disabled", wrap="word",
+                      height=14, padx=8, pady=8)
+        txt.pack(fill="both", expand=True, padx=16, pady=8)
+        txt.tag_config("ok",   foreground="#a6e3a1")
+        txt.tag_config("err",  foreground="#f38ba8")
+        txt.tag_config("info", foreground="#89b4fa")
+
+        close_btn = _btn(win, "Подождите...", style="ghost")
+        close_btn.pack(pady=(0, 12))
+        close_btn.config(state="disabled")
+
+        def append(line: str) -> None:
+            tag = "ok" if "✅" in line else ("err" if "❌" in line else "info")
+            try:
+                txt.config(state="normal")
+                txt.insert("end", line + "\n", tag)
+                txt.see("end")
+                txt.config(state="disabled")
+                win.update()
+            except Exception:
+                pass
+
+        def run_check():
+            from browser_poster import check_and_fix_playwright
+            append("Запуск проверки...")
+            ok, message = check_and_fix_playwright()
+            for line in message.splitlines():
+                append(line)
+            if ok:
+                append("\n✅ Playwright готов к работе!")
+                _logger.success("[GUI] Playwright — проверка пройдена, всё OK")
+            else:
+                append("\n❌ Не удалось исправить Playwright.")
+                append("Попробуйте перезапустить программу.")
+                _logger.error("[GUI] Playwright — проверка провалена")
+            self.after(0, lambda: close_btn.config(
+                text="Закрыть", state="normal",
+                command=win.destroy
+            ))
+
+        # Запускаем в отдельном потоке чтобы не фризить GUI
+        threading.Thread(target=run_check, daemon=True).start()
+
+    # ── Proxies ────────────────────────────────────────────────────────────────
+
+    def _build_proxies(self, pg):
+        pg.columnconfigure(0, weight=1)
+        pg.rowconfigure(1, weight=1)
+
+        bar = self._toolbar(pg, "Proxies")
+        _btn(bar, "＋ Add Proxy", command=self._add_proxy, style="success").pack(side="right", padx=4)
+        _btn(bar, "🗑 Delete",    command=self._del_proxy,  style="danger").pack(side="right", padx=4)
+        _btn(bar, "↻ Refresh",   command=self._refresh_proxies, style="ghost").pack(side="right", padx=4)
+
+        card = self._card(pg, row=1)
+        card.columnconfigure(0, weight=1); card.rowconfigure(0, weight=1)
+        self._proxy_tree = self._tree(card, [
+            ("id",    "ID",     55),
+            ("url",   "URL",    420),
+            ("type",  "Type",   80),
+            ("fails", "Fails",  70),
+            ("active","Active", 80),
+        ])
+
+    def _refresh_proxies(self):
+        async def _load():
+            from db import get_proxies
+            return await get_proxies(active_only=False)
+        def _done(fut):
+            try:
+                self._proxy_tree.delete(*self._proxy_tree.get_children())
+                for p in fut.result():
+                    self._proxy_tree.insert("", "end", values=(
+                        p["id"], p["url"], p["ptype"],
+                        p["fail_count"], "Yes" if p["active"] else "No"))
+            except Exception as e: print(f"[GUI] proxies: {e}")
+        run_async(_load()).add_done_callback(lambda f: self.after(0, _done, f))
+
+    def _add_proxy(self):
+        win = tk.Toplevel(self)
+        win.title("Add Proxy")
+        win.geometry("460x200")
+        win.configure(bg=C["bg"])
+        win.resizable(False, False)
+        win.grab_set()
+
+        hdr = tk.Frame(win, bg=C["accent"], height=44)
+        hdr.pack(fill="x"); hdr.pack_propagate(False)
+        tk.Label(hdr, text="  Add Proxy", font=("Segoe UI",11,"bold"),
+                 fg="white", bg=C["accent"]).pack(side="left", padx=16)
+
+        body = tk.Frame(win, bg=C["bg"])
+        body.pack(fill="both", expand=True, padx=24, pady=12)
+
+        _label(body, "Proxy URL:", size=9, color=C["muted"], bg=C["bg"]).pack(anchor="w")
+        e = _entry(body)
+        e.pack(fill="x", pady=(4,4), ipady=5)
+        e.insert(0, "socks5://user:pass@host:port")
+        e.bind("<FocusIn>", lambda ev: e.select_range(0, "end"))
+        _label(body, "Supports: http:// and socks5://",
+               size=8, color=C["muted"], bg=C["bg"]).pack(anchor="w")
+
+        bf = tk.Frame(body, bg=C["bg"])
+        bf.pack(fill="x", pady=(10,0))
+
+        def do_add():
+            url = e.get().strip()
+            if not url: return
+            async def _go():
+                from db import add_proxy
+                ptype = "socks5" if url.startswith("socks5") else "http"
+                return await add_proxy(url, ptype)
+            def _done(fut):
+                try:
+                    pid = fut.result(); win.destroy()
+                    _logger.success(f"[GUI] ✅ Прокси добавлен id={pid} url={url}")
+                    self._refresh_proxies()
+                    messagebox.showinfo("Added", f"✅  Proxy added (id={pid})", parent=self)
+                except Exception as ex:
+                    _logger.error(f"[GUI] Ошибка добавления прокси: {ex}")
+                    messagebox.showerror("Error", str(ex), parent=self)
+            run_async(_go()).add_done_callback(lambda f: self.after(0, _done, f))
+
+        _btn(bf, "Add Proxy", command=do_add, style="success").pack(side="left")
+        _btn(bf, "Cancel", command=win.destroy, style="ghost").pack(side="left", padx=8)
+
+    def _del_proxy(self):
+        sel = self._proxy_tree.selection()
+        if not sel:
+            messagebox.showwarning("Select", "Select a proxy first", parent=self); return
+        pid = int(self._proxy_tree.item(sel[0])["values"][0])
+        if not messagebox.askyesno("Confirm", f"Delete proxy {pid}?", parent=self): return
+        async def _go():
+            from db import execute
+            await execute("DELETE FROM proxies WHERE id=?", (pid,))
+        def _done(fut):
+            try:
+                fut.result()
+                self._refresh_proxies()
+                _logger.warning(f"[GUI] 🗑 Прокси id={pid} удалён")
+            except Exception as e:
+                _logger.error(f"[GUI] Ошибка удаления прокси id={pid}: {e}")
+                messagebox.showerror("Error", str(e), parent=self)
+        run_async(_go()).add_done_callback(lambda f: self.after(0, _done, f))
+
+    # ── Users ──────────────────────────────────────────────────────────────────
+
+    def _build_users(self, pg):
+        pg.columnconfigure(0, weight=1)
+        pg.rowconfigure(1, weight=1)
+
+        bar = self._toolbar(pg, "Allowed Telegram Users")
+        _btn(bar, "＋ Add User", command=self._add_user,   style="success").pack(side="right", padx=4)
+        _btn(bar, "🗑 Remove",   command=self._del_user,    style="danger").pack(side="right", padx=4)
+        _btn(bar, "↻ Refresh",  command=self._refresh_users, style="ghost").pack(side="right", padx=4)
+
+        # Info label
+        info = tk.Frame(pg, bg=C["bg"])
+        info.grid(row=0, column=0, sticky="ew", padx=16, pady=(0,0))
+
+        card = self._card(pg, row=1)
+        card.columnconfigure(0, weight=1); card.rowconfigure(0, weight=1)
+        self._users_tree = self._tree(card, [
+            ("telegram_id", "Telegram ID", 140),
+            ("label",       "Name / Label", 280),
+            ("added_at",    "Added",        180),
+        ])
+
+        info2 = tk.Label(pg, text=(
+            "ℹ  Users listed here can access the Telegram bot. "
+            "Owner IDs in .env always have access regardless of this list."
+        ), font=("Segoe UI", 8), fg=C["muted"], bg=C["bg"], anchor="w")
+        info2.grid(row=2, column=0, sticky="ew", padx=20, pady=(0, 8))
+
+        self.after(300, self._refresh_users)
+
+    def _refresh_users(self):
+        async def _load():
+            from db import get_allowed_users
+            return await get_allowed_users()
+        def _done(fut):
+            try:
+                self._users_tree.delete(*self._users_tree.get_children())
+                for u in fut.result():
+                    self._users_tree.insert("", "end", values=(
+                        u["telegram_id"],
+                        u.get("label") or "—",
+                        u["added_at"][:16] if u.get("added_at") else "—",
+                    ))
+            except Exception as e:
+                print(f"[GUI] users refresh: {e}")
+        run_async(_load()).add_done_callback(lambda f: self.after(0, _done, f))
+
+    def _add_user(self):
+        win = tk.Toplevel(self)
+        win.title("Add User")
+        win.geometry("420x260")
+        win.configure(bg=C["bg"])
+        win.resizable(False, False)
+        win.grab_set()
+
+        hdr = tk.Frame(win, bg=C["accent"], height=44)
+        hdr.pack(fill="x"); hdr.pack_propagate(False)
+        tk.Label(hdr, text="  Add Allowed User", font=("Segoe UI", 11, "bold"),
+                 fg="white", bg=C["accent"]).pack(side="left", padx=16)
+
+        body = tk.Frame(win, bg=C["bg"])
+        body.pack(fill="both", expand=True, padx=24, pady=12)
+
+        _label(body, "Telegram ID:", size=9, color=C["muted"], bg=C["bg"]).pack(anchor="w")
+        e_id = _entry(body)
+        e_id.pack(fill="x", pady=(4, 4), ipady=5)
+        _label(body, "Find via @userinfobot", size=8, color=C["muted"], bg=C["bg"]).pack(anchor="w")
+
+        _label(body, "Name / Label (optional):", size=9, color=C["muted"], bg=C["bg"]).pack(anchor="w", pady=(8,0))
+        e_label = _entry(body)
+        e_label.pack(fill="x", pady=(4, 8), ipady=5)
+
+        bf = tk.Frame(body, bg=C["bg"])
+        bf.pack(fill="x", pady=(4, 0))
+
+        def do_add():
+            raw = e_id.get().strip()
+            lbl = e_label.get().strip()
+            try:
+                uid = int(raw)
+            except ValueError:
+                messagebox.showwarning("Input", "Telegram ID must be a number", parent=win)
+                return
+            async def _go():
+                from db import add_allowed_user
+                await add_allowed_user(uid, lbl)
+            def _done(fut):
+                try:
+                    fut.result()
+                    win.destroy()
+                    self._refresh_users()
+                    _logger.success(f"[GUI] ✅ Пользователь Telegram id={uid} добавлен (label={lbl!r})")
+                    messagebox.showinfo("Added", f"✅  User {uid} added.", parent=self)
+                except Exception as ex:
+                    _logger.error(f"[GUI] Ошибка добавления пользователя id={uid}: {ex}")
+                    messagebox.showerror("Error", str(ex), parent=win)
+            run_async(_go()).add_done_callback(lambda f: self.after(0, _done, f))
+
+        _btn(bf, "✅  Add User", command=do_add, style="success").pack(side="left")
+        _btn(bf, "Cancel",       command=win.destroy, style="ghost").pack(side="left", padx=8)
+
+        # Enter key submits
+        win.bind("<Return>", lambda e: do_add())
+        e_id.focus_set()
+
+    def _del_user(self):
+        sel = self._users_tree.selection()
+        if not sel:
+            messagebox.showwarning("Select", "Select a user first", parent=self); return
+        uid = int(self._users_tree.item(sel[0])["values"][0])
+        if not messagebox.askyesno("Confirm", f"Remove user {uid}?", parent=self): return
+        async def _go():
+            from db import remove_allowed_user
+            await remove_allowed_user(uid)
+        def _done(fut):
+            try:
+                fut.result()
+                self._refresh_users()
+                _logger.warning(f"[GUI] 🗑 Пользователь Telegram id={uid} удалён")
+            except Exception as e:
+                _logger.error(f"[GUI] Ошибка удаления пользователя id={uid}: {e}")
+                messagebox.showerror("Error", str(e), parent=self)
+        run_async(_go()).add_done_callback(lambda f: self.after(0, _done, f))
+
+    # ── Logs ───────────────────────────────────────────────────────────────────
+
+    def _build_logs(self, pg):
+        pg.columnconfigure(0, weight=1)
+        pg.rowconfigure(1, weight=1)
+        pg.rowconfigure(2, weight=0)
+
+        bar = self._toolbar(pg, "Activity Log")
+        _btn(bar, "↻ Refresh", command=self._refresh_logs, style="ghost").pack(side="right", padx=4)
+        self._log_ar_btn_ref = _btn(
+            bar,
+            "🔁 Auto-refresh ON",
+            command=self._toggle_log_autorefresh,
+            style="ghost",
+        )
+        self._log_ar_btn_ref.pack(side="right", padx=4)
+        self._log_autorefresh = True
+        self._log_refresh_after_id = None
+
+        self._log_filter = tk.StringVar(value="all")
+        ff = tk.Frame(bar, bg=C["bg"])
+        ff.pack(side="right", padx=8)
+        for val, lbl, col in [
+            ("all",     "All",     C["text"]),
+            ("posted",  "Posted",  C["green"]),
+            ("pending", "Pending", C["yellow"]),
+            ("error",   "Error",   C["red"]),
+        ]:
+            tk.Radiobutton(ff, text=lbl, variable=self._log_filter, value=val,
+                           command=self._refresh_logs,
+                           font=("Segoe UI",9), fg=col, bg=C["bg"],
+                           selectcolor=C["bg"], activebackground=C["bg"],
+                           cursor="hand2").pack(side="left", padx=6)
+
+        card = self._card(pg, row=1)
+        card.columnconfigure(0, weight=1); card.rowconfigure(0, weight=1)
+        self._log_tree = self._tree(card, [
+            ("id",      "ID",      45),
+            ("acc",     "Acc",     45),
+            ("status",  "Status",  75),
+            ("ai",      "AI",      65),
+            ("time",    "Time",   130),
+            ("sleep",   "Sleep",   60),
+            ("reply",   "Reply",  260),
+            ("post_url","Post URL",200),
+        ])
+        self._log_tree.tag_configure("posted",  foreground=C["green"])
+        self._log_tree.tag_configure("error",   foreground=C["red"])
+        self._log_tree.tag_configure("pending", foreground=C["yellow"])
+        self._log_tree.bind("<ButtonRelease-1>", self._on_log_select)
+
+        # Detail panel
+        detail_card = self._card(pg, row=2)
+        detail_card.columnconfigure(0, weight=1)
+        detail_card.rowconfigure(1, weight=1)
+        tk.Label(detail_card, text="Reply Preview",
+                 font=("Segoe UI", 9, "bold"),
+                 fg=C["muted"], bg=C["surface"]).grid(
+            row=0, column=0, sticky="w", padx=12, pady=(8,2))
+        self._log_detail = tk.Text(
+            detail_card, font=("Segoe UI", 9),
+            fg=C["text"], bg=C["bg"],
+            height=4, relief="flat", bd=0,
+            wrap="word", state="disabled",
+        )
+        self._log_detail.grid(row=1, column=0, sticky="nsew", padx=12, pady=(0,8))
+
+        # Auto-refresh every 5s
+        self._schedule_log_refresh()
+
+    def _refresh_logs(self):
+        filt = self._log_filter.get()
+        async def _load():
+            from db import fetchall
+            sql = ("SELECT id,account_id,status,ai_provider,created_at,"
+                   "sleep_seconds,reply_text,post_url FROM posts_log")
+            if filt != "all": sql += f" WHERE status='{filt}'"
+            sql += " ORDER BY id DESC LIMIT 200"
+            return await fetchall(sql)
+        def _done(fut):
+            try:
+                self._log_tree.delete(*self._log_tree.get_children())
+                for r in fut.result():
+                    st = r["status"]
+                    tag = st if st in ("posted","error","pending") else ""
+                    sleep_s = r.get("sleep_seconds") or 0
+                    sleep_str = f"{int(sleep_s)}s" if sleep_s else "—"
+                    self._log_tree.insert("", "end", tags=(tag,), values=(
+                        r["id"], r["account_id"], st,
+                        r.get("ai_provider") or "",
+                        r["created_at"],
+                        sleep_str,
+                        str(r.get("reply_text") or "")[:60],
+                        str(r.get("post_url") or "—")))
+            except Exception as e: print(f"[GUI] logs: {e}")
+        run_async(_load()).add_done_callback(lambda f: self.after(0, _done, f))
+
+    def _schedule_log_refresh(self):
+        self._refresh_logs()
+        if getattr(self, "_log_autorefresh", True):
+            self._log_refresh_after_id = self.after(5000, self._schedule_log_refresh)
+        else:
+            self._log_refresh_after_id = None
+
+    def _toggle_log_autorefresh(self):
+        self._log_autorefresh = not self._log_autorefresh
+        if getattr(self, "_log_ar_btn_ref", None) is not None:
+            self._log_ar_btn_ref.config(
+                text=("🔁 Auto-refresh ON" if self._log_autorefresh else "⏸ Auto-refresh OFF")
+            )
+        if not self._log_autorefresh and self._log_refresh_after_id is not None:
+            try:
+                self.after_cancel(self._log_refresh_after_id)
+            except Exception:
+                pass
+            self._log_refresh_after_id = None
+        elif self._log_autorefresh and self._log_refresh_after_id is None:
+            # Restart scheduling immediately when re-enabled
+            self._schedule_log_refresh()
+
+    def _on_log_select(self, event):
+        sel = self._log_tree.selection()
+        if not sel:
+            return
+        vals = self._log_tree.item(sel[0])["values"]
+        # vals: id, acc, status, ai, time, sleep, reply (truncated), post_url
+        log_id = vals[0]
+        async def _load_detail():
+            from db import fetchone
+            r = await fetchone("SELECT reply_text, post_text, comment_text, post_url FROM posts_log WHERE id=?", (log_id,))
+            return r
+        def _done(fut):
+            try:
+                r = fut.result()
+                if not r:
+                    return
+                self._log_detail.config(state="normal")
+                self._log_detail.delete("1.0", "end")
+                self._log_detail.insert("end", f"REPLY: {r.get('reply_text','') or '—'}\n\n")
+                self._log_detail.insert("end", f"POST: {r.get('post_text','')[:200] or '—'}\n")
+                url = r.get("post_url","")
+                if url:
+                    self._log_detail.insert("end", f"URL: {url}")
+                self._log_detail.config(state="disabled")
+            except Exception as e:
+                print(f"[GUI] log detail: {e}")
+        run_async(_load_detail()).add_done_callback(lambda f: self.after(0, _done, f))
+
+    # ── Stats ──────────────────────────────────────────────────────────────────
+
+    def _build_stats(self, pg):
+        pg.columnconfigure(0, weight=1)
+        pg.rowconfigure(2, weight=1)
+
+        bar = self._toolbar(pg, "Statistics")
+        _btn(bar, "↻ Refresh", command=self._refresh_stats, style="ghost").pack(side="right")
+
+        # Summary cards
+        cards_row = tk.Frame(pg, bg=C["bg"])
+        cards_row.grid(row=1, column=0, sticky="ew", padx=12, pady=(0,8))
+        self._sc: dict[str, tk.Label] = {}
+        for key, lbl, accent in [
+            ("today",    "Replies Today",   C["accent"]),
+            ("posted",   "Total Posted",    C["green"]),
+            ("accounts", "Active Accounts", C["yellow"]),
+            ("workers",  "Running Workers", C["text"]),
+        ]:
+            c = tk.Frame(cards_row, bg=C["surface"],
+                         highlightthickness=1,
+                         highlightbackground=C["border"])
+            c.pack(side="left", padx=6, ipadx=20, ipady=12,
+                   expand=True, fill="x")
+            tk.Label(c, text=lbl, font=("Segoe UI",8),
+                     fg=C["muted"], bg=C["surface"]).pack()
+            v = tk.Label(c, text="—", font=("Segoe UI",24,"bold"),
+                         fg=accent, bg=C["surface"])
+            v.pack()
+            self._sc[key] = v
+
+        card = self._card(pg, row=2)
+        card.columnconfigure(0, weight=1); card.rowconfigure(0, weight=1)
+        self._stats_tree = self._tree(card, [
+            ("username", "Account", 220),
+            ("today",    "Today",   100),
+            ("limit",    "Limit",   100),
+            ("bar",      "Usage",   360),
+        ])
+
+    def _refresh_stats(self):
+        async def _load():
+            from db import fetchone, get_accounts, get_daily_count, get_setting
+            try:
+                from main import worker_manager
+                running = len(worker_manager.running_accounts())
+            except Exception: running = 0
+            accs = await get_accounts(active_only=False)
+            active = sum(1 for a in accs if a["active"])
+            total = 0; rows = []
+            for a in accs:
+                cnt = await get_daily_count(a["id"])
+                total += cnt
+                lim = int(await get_setting(a["id"], "daily_limit", 150))
+                pct = int(cnt / max(lim, 1) * 100)
+                bar = "█" * int(pct/5) + "░" * (20 - int(pct/5))
+                rows.append((f"@{a['username']}", cnt, lim, f"{bar}  {pct}%"))
+            tp = await fetchone("SELECT COUNT(*) n FROM posts_log WHERE status='posted'")
+            return rows, total, (tp["n"] if tp else 0), active, running
+        def _done(fut):
+            try:
+                rows, today, posted, active, workers = fut.result()
+                self._sc["today"].config(text=str(today))
+                self._sc["posted"].config(text=str(posted))
+                self._sc["accounts"].config(text=str(active))
+                self._sc["workers"].config(text=str(workers))
+                self._stats_tree.delete(*self._stats_tree.get_children())
+                for row in rows: self._stats_tree.insert("", "end", values=row)
+            except Exception as e: print(f"[GUI] stats: {e}")
+        run_async(_load()).add_done_callback(lambda f: self.after(0, _done, f))
+
+    # ── Telegram Bot ───────────────────────────────────────────────────────────
+
+    def _toggle_tg_bot(self):
+        if self._tg_running: return
+        self._tg_running = True
+        self._tg_btn.config(text="🔄  Starting...", bg=C["yellow"])
+        self.update()
+
+        def _run():
+            import asyncio as _a
+            loop = _a.new_event_loop()
+            _a.set_event_loop(loop)
+            _logger.info("[GUI] Telegram-бот запускается...")
+            try:
+                from main import main as bot_main
+                loop.run_until_complete(bot_main())
+            except Exception as e:
+                err = str(e)
+                if "signal" not in err.lower():
+                    _logger.error(f"[GUI] Telegram-бот упал: {err}")
+                    print(f"[Bot] {e}")
+                self.after(0, lambda: (
+                    setattr(self, "_tg_running", False),
+                    self._tg_btn.config(text="▶  Start Telegram Bot", bg=C["green"]),
+                    self._tg_dot.config(text="● Telegram: Error", fg=C["red"]),
+                ))
+
+        t = threading.Thread(target=_run, daemon=True, name="TelegramBot")
+        t.start()
+
+        # Check after 4s if thread is still alive (means bot started OK)
+        def _check():
+            if t.is_alive():
+                _logger.success("[GUI] ✅ Telegram-бот запущен и работает")
+                self._tg_btn.config(text="✓  Bot Running", bg=_dim(C["green"], 10))
+                self._tg_dot.config(text="●  Telegram: ON", fg=C["green"])
+            else:
+                self._tg_running = False
+                _logger.warning("[GUI] Telegram-бот не запустился (поток завершился)")
+                self._tg_btn.config(text="▶  Start Telegram Bot", bg=C["green"])
+                self._tg_dot.config(text="● Telegram: OFF", fg=C["red"])
+        self.after(4000, _check)
+
+    # ── Auto refresh ───────────────────────────────────────────────────────────
+
+    def _refresh_all(self):
+        self._refresh_accounts()
+        self._refresh_proxies()
+        self._refresh_logs()
+        self._refresh_stats()
+
+    def _auto_refresh(self):
+        self._refresh_all()
+        self.after(12000, self._auto_refresh)
+
+
+# ── Entry point ────────────────────────────────────────────────────────────────
+
+def main():
+    app = XBotApp()
+    app.mainloop()
+
+if __name__ == "__main__":
+    main()
