@@ -1,0 +1,30 @@
+# ── Async HTTP ──
+httpx[http2]==0.27.0
+aiohttp==3.9.5
+
+# ── Database ──
+aiosqlite==0.20.0
+
+# ── Cryptography ──
+cryptography==42.0.5
+
+# ── Configuration ──
+pydantic==2.6.0
+pydantic-settings==2.1.0
+
+# ── AI Providers ──
+openai==1.12.0
+google-generativeai==0.5.3
+
+# ── Telegram ──
+python-telegram-bot==20.8
+
+# ── Browser Automation ──
+curl-cffi==8.5.0
+playwright==1.41.0
+
+# ── Logging ──
+loguru==0.7.2
+
+# ── Utilities ──
+python-dotenv==1.0.1
